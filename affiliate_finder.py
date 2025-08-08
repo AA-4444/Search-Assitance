@@ -69,11 +69,10 @@ def save_request_count(count):
 # Setup classifier
 try:
     classifier = pipeline(
-        "zero-shot-classification",
-        model="distilbert-base-uncased",
-        device=-1,  # CPU
-        clean_up_tokenization_spaces=True
-    )
+    "zero-shot-classification",
+    model="facebook/bart-large-mnli", 
+    device=-1
+)
     logger.info("Classifier initialized: distilbert-base-uncased on CPU")
     print("Classifier initialized: distilbert-base-uncased on CPU")
 except Exception as e:
