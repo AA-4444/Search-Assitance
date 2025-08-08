@@ -29,15 +29,15 @@ FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
 
 app = Flask(
     __name__,
-    static_folder=FRONTEND_DIST,   # чтобы раздавать статику напрямую
-    static_url_path="/"            # чтобы /assets/... корректно отдавались
+    static_folder=FRONTEND_DIST,   # отдаём фронт из собранной папки
+    static_url_path="/"            # чтобы /assets/... открывались корректно
 )
 
 # ========= CORS =========
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    "https://search-assistance-production.up.railway.app",
+    "https://search-assistance-production.up.railway.app",  # проверь, без опечаток
 }
 CORS(
     app,
@@ -509,7 +509,7 @@ def save_to_txt():
     except Exception as e:
         logger.error(f"Error saving to TXT: {e}")
 
-# ========= API (единственный маршрут /search) =========
+# ========= API (основной маршрут /search) =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     if request.method == "OPTIONS":
@@ -590,6 +590,11 @@ def search():
         logger.error(f"API error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# ========= API aliases /api/* =========
+@app.route("/api/search", methods=["POST", "OPTIONS"])
+def api_search():
+    return search()
+
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
     if filetype not in ["csv", "txt"]:
@@ -603,15 +608,17 @@ def download_file(filetype):
     except Exception as e:
         return jsonify({"error": f"Error downloading {filename}: {str(e)}"}), 500
 
+@app.route("/api/download/<filetype>", methods=["GET"])
+def api_download(filetype):
+    return download_file(filetype)
+
 # ========= Serve SPA (frontend_dist) =========
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
-    # если файл реально существует в DIST — отдаем его как статику
     full_path = os.path.join(FRONTEND_DIST, path)
     if path and os.path.exists(full_path) and os.path.isfile(full_path):
         return send_from_directory(FRONTEND_DIST, path)
-    # иначе — всегда index.html (SPA fallback)
     index_path = os.path.join(FRONTEND_DIST, "index.html")
     if os.path.exists(index_path):
         return send_from_directory(FRONTEND_DIST, "index.html")
