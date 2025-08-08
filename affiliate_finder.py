@@ -11,7 +11,7 @@ import random
 import json
 from ddgs import DDGS
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
 # ========= Feature flags / API keys =========
@@ -23,9 +23,17 @@ if TELEGRAM_ENABLED:
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 
-# ========= Flask app + CORS =========
-app = Flask(__name__, template_folder=os.getenv("TEMPLATE_FOLDER", "templates"))
+# ========= Flask app + static frontend =========
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
 
+app = Flask(
+    __name__,
+    static_folder=FRONTEND_DIST,   # чтобы раздавать статику напрямую
+    static_url_path="/"            # чтобы /assets/... корректно отдавались
+)
+
+# ========= CORS =========
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
     "http://127.0.0.1:8080",
@@ -189,7 +197,7 @@ def is_relevant_url(url, prompt_phrases):
     irrelevant = [
         "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
         "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
-        "linguee.com","bab.la","reverso.net","sinonим.org","wordhippo.com","microsoft.com",
+        "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
         "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx"
     ]
     u = (url or "").lower()
@@ -521,7 +529,7 @@ def search():
         query = data.get("query", "")
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
         max_results = int(data.get("max_results", 15))
 
         if not query:
@@ -594,6 +602,20 @@ def download_file(filetype):
         return jsonify({"error": f"{filename} not found"}), 404
     except Exception as e:
         return jsonify({"error": f"Error downloading {filename}: {str(e)}"}), 500
+
+# ========= Serve SPA (frontend_dist) =========
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    # если файл реально существует в DIST — отдаем его как статику
+    full_path = os.path.join(FRONTEND_DIST, path)
+    if path and os.path.exists(full_path) and os.path.isfile(full_path):
+        return send_from_directory(FRONTEND_DIST, path)
+    # иначе — всегда index.html (SPA fallback)
+    index_path = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return "frontend_dist is missing. Please upload your built frontend.", 404
 
 # ========= Entry =========
 if __name__ == "__main__":
