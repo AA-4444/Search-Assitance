@@ -1,3 +1,4 @@
+
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -18,8 +19,7 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 import torch
-from transformers import pipeline
-
+import fcntl  # For file locking on Unix-like systems (Railway)
 
 # Setup Flask app
 app = Flask(__name__)
@@ -52,27 +52,36 @@ MAX_PROXY_ATTEMPTS = 3
 # Telegram API credentials
 API_ID = 2647875768688779
 API_HASH = "6a3ba852e9feb5bf73d7fca3406e2hhghghghghghcfb"
-PHONE_NUMBER = None  # Will be prompted during execution if Telegram search is enabled
+PHONE_NUMBER = os.environ.get("TELEGRAM_PHONE_NUMBER", None)  # Use env var for Railway
 
 def load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
             data = json.load(f)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
             last_reset = data.get("last_reset", "")
             if last_reset:
                 last_reset_date = datetime.strptime(last_reset, "%Y-%m-%d")
                 if last_reset_date.date() < datetime.now().date():
-                    return {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+                    data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+                    save_request_count(0)  # Create the file with default values
             return data
-    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Error loading request count: {e}")
-        print(f"Error loading request count: {e}")
-        return {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        # Initialize file if it doesn't exist
+        data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+        save_request_count(0)
+        logger.info(f"Created new {REQUEST_COUNT_FILE} with count=0")
+        print(f"Created new {REQUEST_COUNT_FILE} with count=0")
+        return data
 
 def save_request_count(count):
     try:
-        with open(REQUEST_COUNT_FILE, "w", encoding="utf-8") as f:
+        with open(REQUEST_COUNT_FILE, "a+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for writing
+            f.seek(0)
             json.dump({"count": count, "last_reset": datetime.now().strftime("%Y-%m-%d")}, f)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
     except Exception as e:
         logger.error(f"Failed to save request count: {e}")
         print(f"Failed to save request count: {e}")
@@ -82,6 +91,8 @@ def load_proxies():
         with open(PROXY_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
+        logger.info(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
+        print(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
         return []
 
 def save_proxies(proxies):
@@ -118,11 +129,9 @@ def get_proxy():
         proxies = fetch_free_proxies()
     return random.choice(proxies) if proxies else None
 
-
-
 # Setup classifier
 try:
-    # Определяем устройство
+    # Determine device
     if torch.cuda.is_available():
         device = 0  # CUDA
     elif torch.backends.mps.is_available():
@@ -133,7 +142,8 @@ try:
     classifier = pipeline(
         "zero-shot-classification",
         model="facebook/bart-large-mnli",
-        device=device
+        device=device,
+        clean_up_tokenization_spaces=True  # Suppress FutureWarning
     )
     logger.info(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
     print(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
@@ -142,20 +152,20 @@ except Exception as e:
     logger.error(f"Failed to initialize facebook/bart-large-mnli: {e}")
     print(f"Failed to initialize facebook/bart-large-mnli: {e}")
 
-    # Фоллбек модель
+    # Fallback model
     classifier = pipeline(
         "zero-shot-classification",
         model="distilbert-base-uncased",
-        device=-1  # CPU
+        device=-1,  # CPU
+        clean_up_tokenization_spaces=True  # Suppress FutureWarning
     )
     logger.info("Fallback classifier initialized: distilbert-base-uncased on CPU")
     print("Fallback classifier initialized: distilbert-base-uncased on CPU")
 
-
 # Initialize SQLite database
 def init_db():
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS results (
                 id TEXT PRIMARY KEY,
@@ -170,8 +180,8 @@ def init_db():
                 score REAL
             )''')
             conn.commit()
-        logger.info("Database initialized")
-        print("Database initialized")
+        logger.info("Database initialized at /tmp/search_results.db")
+        print("Database initialized at /tmp/search_results.db")
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
         print(f"Failed to initialize database: {e}")
@@ -269,7 +279,7 @@ def generate_search_queries(prompt, region="wt-wt"):
     print(f"Generated 1 Telegram query: {telegram_queries}")
     return web_queries, prompt_phrases, region, telegram_queries
 
-# DuckDuckGo search with rate limiting
+# DuckDuckGo search with rate limiting and retry logic
 def duckduckgo_search(query, max_results=15, region="wt-wt"):
     request_data = load_request_count()
     request_count = request_data["count"]
@@ -283,33 +293,45 @@ def duckduckgo_search(query, max_results=15, region="wt-wt"):
     print(f"Performing DuckDuckGo search for query: {query}, region: {region}")
     urls = []
     
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(
-                query,
-                region=region,
-                safesearch="moderate",
-                timelimit="y",
-                max_results=max_results
-            )
-            for result in results:
-                url = result.get("href")
-                if url:
-                    urls.append(url)
-                    logger.info(f"Found URL: {url}")
-                    print(f"Found URL: {url}")
-        
-        request_count += 1
-        save_request_count(request_count)
-        logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-        print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-        
-        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-        return list(set(urls))[:max_results]
-    except Exception as e:
-        logger.error(f"DuckDuckGo search failed for query {query}: {e}")
-        print(f"DuckDuckGo search failed for query {query}: {e}")
-        return urls
+    retries = 3
+    backoff_factor = 5  # Initial wait of 5 seconds, doubles each retry
+    for attempt in range(retries):
+        try:
+            with DDGS() as ddgs:
+                results = ddgs.text(
+                    query,
+                    region=region,
+                    safesearch="moderate",
+                    timelimit="y",
+                    max_results=max_results
+                )
+                for result in results:
+                    url = result.get("href")
+                    if url:
+                        urls.append(url)
+                        logger.info(f"Found URL: {url}")
+                        print(f"Found URL: {url}")
+            
+            request_count += 1
+            save_request_count(request_count)
+            logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+            print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+            
+            time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+            return list(set(urls))[:max_results]
+        except Exception as e:
+            if "202 Ratelimit" in str(e):
+                wait_time = backoff_factor * (2 ** attempt)
+                logger.warning(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries})")
+                print(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"DuckDuckGo search failed for query {query}: {e}")
+                print(f"DuckDuckGo search failed for query {query}: {e}")
+                return urls
+    logger.error(f"Max retries reached for query {query}, returning partial or empty results")
+    print(f"Max retries reached for query {query}, returning partial or empty results")
+    return urls
 
 # Telegram search
 def telegram_search(queries, prompt_phrases):
@@ -322,11 +344,9 @@ def telegram_search(queries, prompt_phrases):
         return results
     
     if not PHONE_NUMBER:
-        PHONE_NUMBER = input("Введите ваш номер телефона для Telegram (в формате +1234567890): ")
-        if not PHONE_NUMBER or not PHONE_NUMBER.startswith("+"):
-            logger.error("Invalid or missing phone number, skipping Telegram search")
-            print("Invalid or missing phone number, skipping Telegram search")
-            return results
+        logger.error("No Telegram phone number provided, skipping Telegram search")
+        print("No Telegram phone number provided, skipping Telegram search")
+        return results
     
     try:
         client = TelegramClient("session_name", API_ID, API_HASH)
@@ -530,7 +550,7 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=15, region="
 # Save to SQLite
 def save_to_db(result, is_relevant, specialization, status, suitability, score):
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute('''INSERT OR IGNORE INTO results (id, name, website, description, specialization, country, source, status, suitability, score)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -545,7 +565,7 @@ def save_to_db(result, is_relevant, specialization, status, suitability, score):
 # Save to CSV
 def save_to_csv():
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM results ORDER BY score DESC")
             rows = cursor.fetchall()
@@ -566,7 +586,7 @@ def save_to_csv():
 # Save to TXT
 def save_to_txt():
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM results ORDER BY score DESC")
             results = cursor.fetchall()
@@ -612,7 +632,7 @@ def search():
         print(f"Received API request: query={query}, region={region}, telegram={use_telegram}")
         
         # Reset database for each request
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS results")
             cursor.execute('''CREATE TABLE results (
@@ -658,13 +678,14 @@ def search():
         response = {
             "results": all_results,
             "telegram_enabled": use_telegram,
-            "region": region
+            "region": region,
+            "message": "No results found, possibly due to rate limits or no matching content" if not all_results else "Search completed successfully"
         }
         return jsonify(response)
     except Exception as e:
         logger.error(f"API error: {e}")
         print(f"API error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "results": [], "telegram_enabled": use_telegram, "region": region, "message": "Search failed due to an error"}), 500
 
 @app.route('/download/<filetype>', methods=['GET'])
 def download_file(filetype):
