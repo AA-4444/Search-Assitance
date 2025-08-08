@@ -1,1 +1,1 @@
-web: python affiliate_finder.py
+web: gunicorn -w 4 -b 0.0.0.0:$PORT affiliate_finder:app
