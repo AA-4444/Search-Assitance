@@ -1,3 +1,4 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 import sqlite3
@@ -659,9 +660,10 @@ def download_file(filetype):
 
 if __name__ == "__main__":
     init_db()  # Initialize database at startup
-    print("Starting Flask server on http://0.0.0.0:5002 (Press CTRL+C to quit)", flush=True)
+    port = int(os.environ.get("PORT", 5002))  # Use Railway's PORT or fallback to 5002
+    print(f"Starting Flask server on http://0.0.0.0:{port} (Press CTRL+C to quit)", flush=True)
     try:
-        app.run(host="0.0.0.0", port=5002, debug=True, use_reloader=False)
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)  # Debug=False for production
     except Exception as e:
         logger.error(f"Flask startup failed: {e}")
         print(f"Flask startup failed: {e}", flush=True)

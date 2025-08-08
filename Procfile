@@ -1,0 +1,1 @@
+web: python affiliate_finder.py
