@@ -1,9 +1,0 @@
-requests
-beautifulsoup4
-sqlite3
-transformers
-torch
-duckduckgo_search
-telethon
-flask
-flask-cors
