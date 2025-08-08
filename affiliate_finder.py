@@ -535,7 +535,7 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
             success = False
             
             while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-                proxy = get_proxy()
+                proxy = get_proxy() if proxy_attempts > 0 else None
                 if proxy and proxy in proxies_used:
                     logger.warning(f"No more unique proxies available for {url}")
                     print(f"No more unique proxies available for {url}")
@@ -545,7 +545,7 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
                 
                 try:
                     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
-                    response = requests.get(url, headers=headers, timeout=10, verify=False, proxies=proxy)
+                    response = requests.get(url, headers=headers, timeout=10, verify=False, proxies=proxy if proxy else None)
                     response.raise_for_status()
                     soup = BeautifulSoup(response.content, "html.parser")
                     
@@ -606,25 +606,82 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
                     break
                 except Exception as e:
                     error_str = str(e).lower()
-                    if any(err in error_str for err in ["403", "429", "connection", "timeout", "ssl"]):
+                    if any(err in error_str for err in ["403", "429", "connection", "timeout", "ssl", "parse"]):
                         logger.warning(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
                         print(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
                         proxy_attempts += 1
-                        if proxy_attempts > MAX_PROXY_ATTEMPTS:
-                            logger.warning(f"Max proxy attempts reached for {url}, skipping")
-                            print(f"Max proxy attempts reached for {url}, skipping")
-                            break
                     else:
                         logger.error(f"Scraping failed for {url}: {e}, skipping")
                         print(f"Scraping failed for {url}: {e}, skipping")
                         break
                 
-                if success:
-                    break
-            
             if not success:
-                logger.warning(f"Failed to scrape {url} after all attempts")
-                print(f"Failed to scrape {url} after all attempts")
+                # Retry without proxy
+                try:
+                    logger.info(f"Retrying {url} without proxy")
+                    print(f"Retrying {url} without proxy")
+                    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
+                    response = requests.get(url, headers=headers, timeout=10, verify=False)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, "html.parser")
+                    
+                    name_selectors = ["h1[class*='brand'], h1[class*='partner'], .company-name, .brand-name, .site-title, .logo-text, title, h1, .header-title"]
+                    description_selectors = [".description, .about, .content, .intro, div[class*='about'], section[class*='program'], p[class*='description'], meta[name='description'], div[class*='overview'], p"]
+                    country_selectors = [".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info"]
+                    
+                    name = None
+                    for selector in name_selectors:
+                        element = soup.select_one(selector)
+                        if element:
+                            name = clean_description(element.text)
+                            if len(name) > 5:
+                                break
+                    name = name or "N/A"
+                    
+                    description = None
+                    for selector in description_selectors:
+                        element = soup.select_one(selector)
+                        if element:
+                            description = clean_description(element.get("content") if element.get("content") else element.text)
+                            if len(description) > 10:
+                                break
+                    description = description or "N/A"
+                    
+                    country = None
+                    for selector in country_selectors:
+                        element = soup.select_one(selector)
+                        if element:
+                            country = clean_description(element.text)
+                            if len(country) > 2:
+                                break
+                    country = country or "N/A"
+                    
+                    is_relevant, specialization, status, suitability = analyze_result(description, prompt_phrases)
+                    score = rank_result(description, prompt_phrases)
+                    source = "SerpAPI" if url in serp_urls else "DuckDuckGo"
+                    if is_relevant_url(url, prompt_phrases) or score > 0.1:
+                        result = {
+                            "id": str(uuid.uuid4()),
+                            "name": name,
+                            "website": url,
+                            "description": description,
+                            "country": country,
+                            "source": source,
+                            "score": score
+                        }
+                        results.append(result)
+                        logger.info(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}, Proxy=None")
+                        print(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}, Proxy=None")
+                        save_to_db(result, is_relevant, specialization, status, suitability, score)
+                    else:
+                        logger.info(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}, Proxy=None")
+                        print(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}, Proxy=None")
+                    
+                    success = True
+                    time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+                except Exception as e:
+                    logger.error(f"Final scraping attempt failed for {url}: {e}, skipping")
+                    print(f"Final scraping attempt failed for {url}: {e}, skipping")
     
     results.sort(key=lambda x: x["score"], reverse=True)
     logger.info(f"Total web results scraped: {len(results)}")
