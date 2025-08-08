@@ -10,8 +10,6 @@ import uuid
 import random
 import urllib.parse
 import json
-from duckduckgo_search import DDGS
-from datetime import datetime
 from telethon.sync import TelegramClient
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -39,19 +37,14 @@ logger = logging.getLogger(__name__)
 
 # Track API requests
 REQUEST_COUNT_FILE = "request_count.json"
-DAILY_REQUEST_LIMIT = 1000
+DAILY_REQUEST_LIMIT = 100  # Adjust based on your SerpAPI plan (e.g., free tier: 100 searches/month)
 REQUEST_PAUSE_MIN = 0.5
 REQUEST_PAUSE_MAX = 1
 
-# Proxy settings
-PROXY_CACHE_FILE = "proxies.json"
-PROXY_API_URL = "https://www.proxy-list.download/api/v1/get?type=https&anon=elite"
-MAX_PROXY_ATTEMPTS = 3
-
 # Telegram API credentials
-API_ID = 2647875768688779
-API_HASH = "6a3ba852e9feb5bf73d7fca3406e2hhghghghghghcfb"
-PHONE_NUMBER = os.environ.get("TELEGRAM_PHONE_NUMBER", None)  # Use env var for Railway
+API_ID = int(os.environ.get("TELEGRAM_API_ID"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH")
+PHONE_NUMBER = os.environ.get("TELEGRAM_PHONE_NUMBER")
 
 def load_request_count():
     try:
@@ -83,49 +76,6 @@ def save_request_count(count):
     except Exception as e:
         logger.error(f"Failed to save request count: {e}")
         print(f"Failed to save request count: {e}")
-
-def load_proxies():
-    try:
-        with open(PROXY_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        logger.info(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
-        print(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
-        return []
-
-def save_proxies(proxies):
-    try:
-        with open(PROXY_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(proxies, f)
-    except Exception as e:
-        logger.error(f"Failed to save proxies: {e}")
-        print(f"Failed to save proxies: {e}")
-
-def fetch_free_proxies():
-    logger.info("Fetching free proxies from API")
-    print("Fetching free proxies from API")
-    proxies = []
-    try:
-        response = requests.get(PROXY_API_URL, timeout=10)
-        response.raise_for_status()
-        proxy_list = response.text.strip().split("\n")
-        for proxy in proxy_list:
-            if ":" in proxy:
-                proxies.append({"https": f"https://{proxy}"})
-        save_proxies(proxies)
-        logger.info(f"Fetched {len(proxies)} proxies")
-        print(f"Fetched {len(proxies)} proxies")
-        return proxies
-    except Exception as e:
-        logger.error(f"Failed to fetch proxies: {e}")
-        print(f"Failed to fetch proxies: {e}")
-        return []
-
-def get_proxy():
-    proxies = load_proxies()
-    if not proxies:
-        proxies = fetch_free_proxies()
-    return random.choice(proxies) if proxies else None
 
 # Setup classifier
 try:
@@ -273,8 +223,8 @@ def generate_search_queries(prompt, region="wt-wt"):
     print(f"Generated 1 Telegram query: {telegram_queries}")
     return web_queries, prompt_phrases, region, telegram_queries
 
-# DuckDuckGo search with proxies and retry logic
-def duckduckgo_search(query, max_results=5, region="wt-wt"):
+# SerpAPI search
+def serpapi_search(query, max_results=5, region="wt-wt"):
     request_data = load_request_count()
     request_count = request_data["count"]
     
@@ -283,64 +233,65 @@ def duckduckgo_search(query, max_results=5, region="wt-wt"):
         print("Daily request limit reached")
         return []
     
-    logger.info(f"Performing DuckDuckGo search for query: {query}, region: {region}, max_results: {max_results}")
-    print(f"Performing DuckDuckGo search for query: {query}, region: {region}, max_results: {max_results}")
+    logger.info(f"Performing SerpAPI search for query: {query}, region: {region}, max_results: {max_results}")
+    print(f"Performing SerpAPI search for query: {query}, region: {region}, max_results: {max_results}")
+    
+    api_key = os.environ.get("SERPAPI_KEY")
+    if not api_key:
+        logger.error("SERPAPI_KEY environment variable not set")
+        print("SERPAPI_KEY environment variable not set")
+        return []
+    
     urls = []
+    params = {
+        "q": query,
+        "api_key": api_key,
+        "num": max_results,
+        "hl": region.split("-")[1] if region != "wt-wt" else "en",
+        "gl": region.split("-")[0] if region != "wt-wt" else None,
+        "location": "United States" if region == "us-en" else None,
+        "tbm": "lcl" if region == "us-en" else None
+    }
+    params = {k: v for k, v in params.items() if v is not None}
     
-    retries = 3
-    backoff_factor = 1  # Initial wait of 1 second, doubles each retry
-    proxy_attempts = 0
-    proxies_used = []
-    
-    while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-        proxy = get_proxy() if proxy_attempts > 0 else None
-        if proxy and proxy in proxies_used:
-            logger.warning("No more unique proxies available")
-            print("No more unique proxies available")
-            break
-        if proxy:
-            proxies_used.append(proxy)
+    for attempt in range(3):
+        try:
+            response = requests.get("https://serpapi.com/search", params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("organic_results", []) or data.get("local_results", [])
+            for result in results[:max_results]:
+                url = result.get("link") or result.get("website")
+                if url:
+                    urls.append(url)
+                    logger.info(f"Found URL: {url}")
+                    print(f"Found URL: {url}")
+            
+            request_count += 1
+            save_request_count(request_count)
+            logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+            print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+            
+            time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+            return list(set(urls))[:max_results]
         
-        for attempt in range(retries):
-            try:
-                with DDGS(proxies=proxy) as ddgs:
-                    results = ddgs.text(
-                        query,
-                        region=region,
-                        safesearch="moderate",
-                        timelimit="y",
-                        max_results=max_results
-                    )
-                    for result in results:
-                        url = result.get("href")
-                        if url:
-                            urls.append(url)
-                            logger.info(f"Found URL: {url}, Proxy: {proxy}")
-                            print(f"Found URL: {url}, Proxy: {proxy}")
-                
-                request_count += 1
-                save_request_count(request_count)
-                logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-                print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-                
-                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-                return list(set(urls))[:max_results]
-            except Exception as e:
-                if "202 Ratelimit" in str(e):
-                    wait_time = backoff_factor * (2 ** attempt)
-                    logger.warning(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
-                    print(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
-                    print(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
-                    break
-        proxy_attempts += 1
-        logger.warning(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
-        print(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"SerpAPI search failed for query {query}: {e}")
+            print(f"SerpAPI search failed for query {query}: {e}")
+            if response.status_code == 403:
+                logger.error("SerpAPI: Invalid API key or authentication error")
+                print("SerpAPI: Invalid API key or authentication error")
+                return []
+            if response.status_code == 429:
+                logger.error("SerpAPI: Rate limit exceeded")
+                print("SerpAPI: Rate limit exceeded")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            return []
     
-    logger.warning(f"Max retries and proxies reached for query {query}, returning empty results")
-    print(f"Max retries and proxies reached for query {query}, returning empty results")
+    logger.warning(f"Max retries reached for query {query}, returning empty results")
+    print(f"Max retries reached for query {query}, returning empty results")
     return []
 
 # Telegram search
@@ -437,16 +388,16 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
         print(f"Processing web query {i}/{total_queries}: {query}")
         for attempt in range(2):
             try:
-                urls.extend(duckduckgo_search(query, max_results, region))
+                urls.extend(serpapi_search(query, max_results, region))
                 break
             except Exception as e:
-                logger.error(f"DuckDuckGo attempt {attempt + 1} failed for query {query}: {e}")
-                print(f"DuckDuckGo attempt {attempt + 1} failed for query {query}: {e}")
+                logger.error(f"SerpAPI attempt {attempt + 1} failed for query {query}: {e}")
+                print(f"SerpAPI attempt {attempt + 1} failed for query {query}: {e}")
                 time.sleep(random.uniform(0.5, 1))
     
     if not urls:
-        logger.warning("No URLs found from DuckDuckGo search")
-        print("No URLs found from DuckDuckGo search")
+        logger.warning("No URLs found from SerpAPI search")
+        print("No URLs found from SerpAPI search")
     else:
         urls = list(set(urls))[:30]
         logger.info(f"Total unique URLs found: {len(urls)}")
@@ -456,100 +407,67 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
         for i, url in enumerate(urls, 1):
             logger.info(f"Scraping URL {i}/{total_urls}: {url}")
             print(f"Scraping URL {i}/{total_urls}: {url}")
-            proxy_attempts = 0
-            proxies_used = []
-            success = False
-            
-            while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-                proxy = get_proxy()
-                if proxy and proxy in proxies_used:
-                    logger.warning(f"No more unique proxies available for {url}")
-                    print(f"No more unique proxies available for {url}")
-                    break
-                if proxy:
-                    proxies_used.append(proxy)
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
+                response = requests.get(url, headers=headers, timeout=10, verify=False)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, "html.parser")
                 
-                try:
-                    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
-                    response = requests.get(url, headers=headers, timeout=10, verify=False, proxies=proxy)
-                    response.raise_for_status()
-                    soup = BeautifulSoup(response.content, "html.parser")
-                    
-                    name_selectors = ["h1[class*='brand'], h1[class*='partner'], .company-name, .brand-name, .site-title, .logo-text, title, h1, .header-title"]
-                    description_selectors = [".description, .about, .content, .intro, div[class*='about'], section[class*='program'], p[class*='description'], meta[name='description'], div[class*='overview'], p"]
-                    country_selectors = [".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info"]
-                    
-                    name = None
-                    for selector in name_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            name = clean_description(element.text)
-                            if len(name) > 5:
-                                break
-                    name = name or "N/A"
-                    
-                    description = None
-                    for selector in description_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            description = clean_description(element.get("content") if element.get("content") else element.text)
-                            if len(description) > 10:
-                                break
-                    description = description or "N/A"
-                    
-                    country = None
-                    for selector in country_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            country = clean_description(element.text)
-                            if len(country) > 2:
-                                break
-                    country = country or "N/A"
-                    
-                    is_relevant, specialization, status, suitability = analyze_result(description, prompt_phrases)
-                    score = rank_result(description, prompt_phrases)
-                    if is_relevant_url(url, prompt_phrases) or score > 0.1:
-                        result = {
-                            "id": str(uuid.uuid4()),
-                            "name": name,
-                            "website": url,
-                            "description": description,
-                            "country": country,
-                            "source": "DuckDuckGo",
-                            "score": score
-                        }
-                        results.append(result)
-                        logger.info(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Proxy={proxy}")
-                        print(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Proxy={proxy}")
-                        save_to_db(result, is_relevant, specialization, status, suitability, score)
-                    else:
-                        logger.info(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Proxy={proxy}")
-                        print(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Proxy={proxy}")
-                    
-                    success = True
-                    time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-                    break
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if any(err in error_str for err in ["403", "429", "connection", "timeout", "ssl"]):
-                        logger.warning(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
-                        print(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
-                        proxy_attempts += 1
-                        if proxy_attempts > MAX_PROXY_ATTEMPTS:
-                            logger.warning(f"Max proxy attempts reached for {url}, skipping")
-                            print(f"Max proxy attempts reached for {url}, skipping")
+                name_selectors = ["h1[class*='brand'], h1[class*='partner'], .company-name, .brand-name, .site-title, .logo-text, title, h1, .header-title"]
+                description_selectors = [".description, .about, .content, .intro, div[class*='about'], section[class*='program'], p[class*='description'], meta[name='description'], div[class*='overview'], p"]
+                country_selectors = [".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info"]
+                
+                name = None
+                for selector in name_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        name = clean_description(element.text)
+                        if len(name) > 5:
                             break
-                    else:
-                        logger.error(f"Scraping failed for {url}: {e}, skipping")
-                        print(f"Scraping failed for {url}: {e}, skipping")
-                        break
+                name = name or "N/A"
                 
-                if success:
-                    break
-            
-            if not success:
-                logger.warning(f"Failed to scrape {url} after all attempts")
-                print(f"Failed to scrape {url} after all attempts")
+                description = None
+                for selector in description_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        description = clean_description(element.get("content") if element.get("content") else element.text)
+                        if len(description) > 10:
+                            break
+                description = description or "N/A"
+                
+                country = None
+                for selector in country_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        country = clean_description(element.text)
+                        if len(country) > 2:
+                            break
+                country = country or "N/A"
+                
+                is_relevant, specialization, status, suitability = analyze_result(description, prompt_phrases)
+                score = rank_result(description, prompt_phrases)
+                if is_relevant_url(url, prompt_phrases) or score > 0.1:
+                    result = {
+                        "id": str(uuid.uuid4()),
+                        "name": name,
+                        "website": url,
+                        "description": description,
+                        "country": country,
+                        "source": "SerpAPI",
+                        "score": score
+                    }
+                    results.append(result)
+                    logger.info(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}")
+                    print(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}")
+                    save_to_db(result, is_relevant, specialization, status, suitability, score)
+                else:
+                    logger.info(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score})")
+                    print(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score})")
+                
+                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+            except Exception as e:
+                logger.error(f"Scraping failed for {url}: {e}")
+                print(f"Scraping failed for {url}: {e}")
     
     results.sort(key=lambda x: x["score"], reverse=True)
     logger.info(f"Total web results scraped: {len(results)}")
