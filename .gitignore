@@ -1,7 +1,7 @@
 *.db
 *.csv
-*.txt
 *.log
 *.json
 *.session
 .DS_Store
+!requirements.txt
