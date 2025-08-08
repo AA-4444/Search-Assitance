@@ -10,7 +10,7 @@ import uuid
 import random
 import urllib.parse
 import json
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 from datetime import datetime
 from telethon.sync import TelegramClient
 from telethon.tl.functions.contacts import SearchRequest
