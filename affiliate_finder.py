@@ -1,4 +1,3 @@
-
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -41,8 +40,8 @@ logger = logging.getLogger(__name__)
 # Track API requests
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = 1000
-REQUEST_PAUSE_MIN = 2
-REQUEST_PAUSE_MAX = 3
+REQUEST_PAUSE_MIN = 0.5
+REQUEST_PAUSE_MAX = 1
 
 # Proxy settings
 PROXY_CACHE_FILE = "proxies.json"
@@ -68,7 +67,6 @@ def load_request_count():
                     save_request_count(0)  # Create the file with default values
             return data
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        # Initialize file if it doesn't exist
         data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
         save_request_count(0)
         logger.info(f"Created new {REQUEST_COUNT_FILE} with count=0")
@@ -131,7 +129,6 @@ def get_proxy():
 
 # Setup classifier
 try:
-    # Determine device
     if torch.cuda.is_available():
         device = 0  # CUDA
     elif torch.backends.mps.is_available():
@@ -143,7 +140,7 @@ try:
         "zero-shot-classification",
         model="facebook/bart-large-mnli",
         device=device,
-        clean_up_tokenization_spaces=True  # Suppress FutureWarning
+        clean_up_tokenization_spaces=True
     )
     logger.info(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
     print(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
@@ -151,13 +148,11 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize facebook/bart-large-mnli: {e}")
     print(f"Failed to initialize facebook/bart-large-mnli: {e}")
-
-    # Fallback model
     classifier = pipeline(
         "zero-shot-classification",
         model="distilbert-base-uncased",
-        device=-1,  # CPU
-        clean_up_tokenization_spaces=True  # Suppress FutureWarning
+        device=-1,
+        clean_up_tokenization_spaces=True
     )
     logger.info("Fallback classifier initialized: distilbert-base-uncased on CPU")
     print("Fallback classifier initialized: distilbert-base-uncased on CPU")
@@ -192,7 +187,7 @@ def clean_description(description):
         return "N/A"
     soup = BeautifulSoup(str(description), "html.parser")
     text = soup.get_text().strip()
-    return ' '.join(text.split()[:200])  # Limit to 200 words
+    return ' '.join(text.split()[:200])
 
 # Filter URLs for relevance
 def is_relevant_url(url, prompt_phrases):
@@ -203,19 +198,19 @@ def is_relevant_url(url, prompt_phrases):
     prompt_words = [word.lower() for phrase in prompt_phrases for word in phrase.split() if len(word) > 3]
     return "t.me" in url.lower() or "instagram.com" in url.lower() or any(word in url.lower() for word in prompt_words) or any(phrase.lower() in url.lower() for phrase in prompt_phrases)
 
-# Rank results based on prompt relevance
+# Rank results
 def rank_result(description, prompt_phrases):
     score = 0
     description = description.lower()
     prompt_words = [word.lower() for phrase in prompt_phrases for word in phrase.split() if len(word) > 3]
     for word in prompt_words:
         if word in description:
-            score += 0.3 if len(word) > 6 else 0.2  # Higher weight for longer words
+            score += 0.3 if len(word) > 6 else 0.2
     for phrase in prompt_phrases:
         if phrase.lower() in description:
-            score += 0.4  # Additional weight for full phrase
+            score += 0.4
     if any(x in description for x in ["t.me", "instagram.com"]):
-        score += 0.2  # Bonus for social media
+        score += 0.2
     return min(score, 1.0)
 
 # Analyze result
@@ -231,7 +226,6 @@ def analyze_result(description, prompt_phrases):
         suitability = f"Подходит: Связан с {specialization}"
         return True, specialization, status, suitability
     
-    # Dynamic labels based on prompt_phrases
     labels = [phrase.title() for phrase in prompt_phrases[:3]] + ["Social Media", "Other"]
     if not labels:
         labels = ["Relevant", "Other"]
@@ -251,7 +245,7 @@ def analyze_result(description, prompt_phrases):
         status = "Active" if any(word in cleaned_description for word in prompt_words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
-# Generate search queries from user prompt
+# Generate search queries
 def generate_search_queries(prompt, region="wt-wt"):
     valid_regions = ["wt-wt", "ua-ua", "ru-ru", "us-en", "de-de", "fr-fr", "uk-en"]
     prompt = prompt.strip()
@@ -279,8 +273,8 @@ def generate_search_queries(prompt, region="wt-wt"):
     print(f"Generated 1 Telegram query: {telegram_queries}")
     return web_queries, prompt_phrases, region, telegram_queries
 
-# DuckDuckGo search with rate limiting and retry logic
-def duckduckgo_search(query, max_results=15, region="wt-wt"):
+# DuckDuckGo search with proxies and retry logic
+def duckduckgo_search(query, max_results=5, region="wt-wt"):
     request_data = load_request_count()
     request_count = request_data["count"]
     
@@ -289,49 +283,65 @@ def duckduckgo_search(query, max_results=15, region="wt-wt"):
         print("Daily request limit reached")
         return []
     
-    logger.info(f"Performing DuckDuckGo search for query: {query}, region: {region}")
-    print(f"Performing DuckDuckGo search for query: {query}, region: {region}")
+    logger.info(f"Performing DuckDuckGo search for query: {query}, region: {region}, max_results: {max_results}")
+    print(f"Performing DuckDuckGo search for query: {query}, region: {region}, max_results: {max_results}")
     urls = []
     
     retries = 3
-    backoff_factor = 5  # Initial wait of 5 seconds, doubles each retry
-    for attempt in range(retries):
-        try:
-            with DDGS() as ddgs:
-                results = ddgs.text(
-                    query,
-                    region=region,
-                    safesearch="moderate",
-                    timelimit="y",
-                    max_results=max_results
-                )
-                for result in results:
-                    url = result.get("href")
-                    if url:
-                        urls.append(url)
-                        logger.info(f"Found URL: {url}")
-                        print(f"Found URL: {url}")
-            
-            request_count += 1
-            save_request_count(request_count)
-            logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-            print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-            
-            time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-            return list(set(urls))[:max_results]
-        except Exception as e:
-            if "202 Ratelimit" in str(e):
-                wait_time = backoff_factor * (2 ** attempt)
-                logger.warning(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries})")
-                print(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries})")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"DuckDuckGo search failed for query {query}: {e}")
-                print(f"DuckDuckGo search failed for query {query}: {e}")
-                return urls
-    logger.error(f"Max retries reached for query {query}, returning partial or empty results")
-    print(f"Max retries reached for query {query}, returning partial or empty results")
-    return urls
+    backoff_factor = 1  # Initial wait of 1 second, doubles each retry
+    proxy_attempts = 0
+    proxies_used = []
+    
+    while proxy_attempts <= MAX_PROXY_ATTEMPTS:
+        proxy = get_proxy() if proxy_attempts > 0 else None
+        if proxy and proxy in proxies_used:
+            logger.warning("No more unique proxies available")
+            print("No more unique proxies available")
+            break
+        if proxy:
+            proxies_used.append(proxy)
+        
+        for attempt in range(retries):
+            try:
+                with DDGS(proxies=proxy) as ddgs:
+                    results = ddgs.text(
+                        query,
+                        region=region,
+                        safesearch="moderate",
+                        timelimit="y",
+                        max_results=max_results
+                    )
+                    for result in results:
+                        url = result.get("href")
+                        if url:
+                            urls.append(url)
+                            logger.info(f"Found URL: {url}, Proxy: {proxy}")
+                            print(f"Found URL: {url}, Proxy: {proxy}")
+                
+                request_count += 1
+                save_request_count(request_count)
+                logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+                print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+                
+                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+                return list(set(urls))[:max_results]
+            except Exception as e:
+                if "202 Ratelimit" in str(e):
+                    wait_time = backoff_factor * (2 ** attempt)
+                    logger.warning(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
+                    print(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
+                    print(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
+                    break
+        proxy_attempts += 1
+        logger.warning(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
+        print(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
+    
+    logger.warning(f"Max retries and proxies reached for query {query}, returning empty results")
+    print(f"Max retries and proxies reached for query {query}, returning empty results")
+    return []
 
 # Telegram search
 def telegram_search(queries, prompt_phrases):
@@ -415,7 +425,7 @@ def telegram_search(queries, prompt_phrases):
     return results
 
 # Scrape and analyze websites
-def search_and_scrape_websites(queries, prompt_phrases, max_results=15, region="wt-wt"):
+def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="wt-wt"):
     logger.info(f"Starting web search for {len(queries)} queries in region: {region}")
     print(f"Starting web search for {len(queries)} queries in region: {region}")
     results = []
@@ -432,13 +442,13 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=15, region="
             except Exception as e:
                 logger.error(f"DuckDuckGo attempt {attempt + 1} failed for query {query}: {e}")
                 print(f"DuckDuckGo attempt {attempt + 1} failed for query {query}: {e}")
-                time.sleep(random.uniform(1, 2))
+                time.sleep(random.uniform(0.5, 1))
     
     if not urls:
         logger.warning("No URLs found from DuckDuckGo search")
         print("No URLs found from DuckDuckGo search")
     else:
-        urls = list(set(urls))[:50]
+        urls = list(set(urls))[:30]
         logger.info(f"Total unique URLs found: {len(urls)}")
         print(f"Total unique URLs found: {len(urls)}")
         
@@ -451,18 +461,17 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=15, region="
             success = False
             
             while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-                proxy = None
-                if proxy_attempts > 0:
-                    proxy = get_proxy()
-                    if not proxy or proxy in proxies_used:
-                        logger.warning(f"No more unique proxies available for {url}")
-                        print(f"No more unique proxies available for {url}")
-                        break
+                proxy = get_proxy()
+                if proxy and proxy in proxies_used:
+                    logger.warning(f"No more unique proxies available for {url}")
+                    print(f"No more unique proxies available for {url}")
+                    break
+                if proxy:
                     proxies_used.append(proxy)
                 
                 try:
                     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
-                    response = requests.get(url, headers=headers, timeout=15, verify=False, proxies=proxy)
+                    response = requests.get(url, headers=headers, timeout=10, verify=False, proxies=proxy)
                     response.raise_for_status()
                     soup = BeautifulSoup(response.content, "html.parser")
                     
@@ -626,12 +635,11 @@ def search():
         use_telegram = data.get('telegram', False)
         
         if not query:
-            return jsonify({"error": "Query is required"}), 400
+            return jsonify({"error": "Query is required", "results": [], "telegram_enabled": use_telegram, "region": region, "message": "No query provided"}), 400
         
         logger.info(f"Received API request: query={query}, region={region}, telegram={use_telegram}")
         print(f"Received API request: query={query}, region={region}, telegram={use_telegram}")
         
-        # Reset database for each request
         with sqlite3.connect("/tmp/search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS results")
@@ -652,13 +660,10 @@ def search():
         logger.info("Database reset")
         print("Database reset")
         
-        # Generate queries
         web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(query, region)
         
-        # Perform web search
-        web_results = search_and_scrape_websites(web_queries, prompt_phrases, max_results=15, region=region)
+        web_results = search_and_scrape_websites(web_queries, prompt_phrases, max_results=5, region=region)
         
-        # Perform Telegram search if enabled
         telegram_results = []
         if use_telegram:
             telegram_results = telegram_search(telegram_queries, prompt_phrases)
@@ -666,15 +671,12 @@ def search():
             logger.info("Telegram search skipped")
             print("Telegram search skipped")
         
-        # Combine results
         all_results = web_results + telegram_results
         all_results.sort(key=lambda x: x["score"], reverse=True)
         
-        # Save to files
         save_to_csv()
         save_to_txt()
         
-        # Return JSON response
         response = {
             "results": all_results,
             "telegram_enabled": use_telegram,
@@ -706,11 +708,11 @@ def download_file(filetype):
         return jsonify({"error": f"Error downloading {filename}: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    init_db()  # Initialize database at startup
-    port = int(os.environ.get("PORT", 5002))  # Use Railway's PORT or fallback to 5002
+    init_db()
+    port = int(os.environ.get("PORT", 5002))
     print(f"Starting Flask server on http://0.0.0.0:{port} (Press CTRL+C to quit)", flush=True)
     try:
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)  # Debug=False for production
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
     except Exception as e:
         logger.error(f"Flask startup failed: {e}")
         print(f"Flask startup failed: {e}", flush=True)
