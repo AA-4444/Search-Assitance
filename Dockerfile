@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Рабочая директория
 WORKDIR /app
+
+# Сначала обновим инструменты сборки Python
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # Кэш зависимостей
 COPY requirements.txt /app/requirements.txt
@@ -17,16 +19,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копия исходников
 COPY . /app
 
-# Порт (Railway выставит $PORT)
 ENV PORT=5000
 ENV HOST=0.0.0.0
 ENV PYTHONUNBUFFERED=1
-
-# Опциональные ENV по умолчанию
 ENV SEARCH_ENGINE=both
 ENV CLASSIFIER_DEVICE=-1
 ENV LOG_TO_FILE=false
 ENV TELEGRAM_ENABLED=false
 
-# Запуск через gunicorn
 CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:${PORT}", "--workers", "2", "--threads", "8", "--timeout", "120"]
+
