@@ -1,32 +1,32 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
-# Install system dependencies
+# Системные зависимости
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libglib2.0-0 \
-    libsqlite3-dev \
-    gcc \
-    g++ \
-    libssl-dev \
-    zlib1g-dev \
-    libbz2-dev \
-    libffi-dev \
+    git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Рабочая директория
 WORKDIR /app
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
-
-# Install PyTorch first to avoid conflicts
-RUN pip install --no-cache-dir torch==2.4.1
-
-# Install remaining dependencies
+# Кэш зависимостей
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY . .
+# Копия исходников
+COPY . /app
 
+# Порт (Railway выставит $PORT)
+ENV PORT=5000
+ENV HOST=0.0.0.0
 ENV PYTHONUNBUFFERED=1
 
-CMD gunicorn -w 2 -b 0.0.0.0:$PORT affiliate_finder:app
+# Опциональные ENV по умолчанию
+ENV SEARCH_ENGINE=both
+ENV CLASSIFIER_DEVICE=-1
+ENV LOG_TO_FILE=false
+ENV TELEGRAM_ENABLED=false
+
+# Запуск через gunicorn
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:${PORT}", "--workers", "2", "--threads", "8", "--timeout", "120"]
