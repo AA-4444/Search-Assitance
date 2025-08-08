@@ -17,6 +17,9 @@ from telethon.tl.functions.contacts import SearchRequest
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
+import torch
+from transformers import pipeline
+
 
 # Setup Flask app
 app = Flask(__name__)
@@ -115,16 +118,39 @@ def get_proxy():
         proxies = fetch_free_proxies()
     return random.choice(proxies) if proxies else None
 
+
+
 # Setup classifier
 try:
-    classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device="mps")
-    logger.info("Classifier initialized: facebook/bart-large-mnli on MPS")
-    print("Classifier initialized: facebook/bart-large-mnli on MPS")
+    # Определяем устройство
+    if torch.cuda.is_available():
+        device = 0  # CUDA
+    elif torch.backends.mps.is_available():
+        device = "mps"  # Apple GPU
+    else:
+        device = -1  # CPU
+
+    classifier = pipeline(
+        "zero-shot-classification",
+        model="facebook/bart-large-mnli",
+        device=device
+    )
+    logger.info(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
+    print(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
+
 except Exception as e:
     logger.error(f"Failed to initialize facebook/bart-large-mnli: {e}")
-    classifier = pipeline("zero-shot-classification", model="distilbert-base-uncased", device="mps")
-    logger.info("Fallback classifier initialized: distilbert-base-uncased on MPS")
-    print("Fallback classifier initialized: distilbert-base-uncased on MPS")
+    print(f"Failed to initialize facebook/bart-large-mnli: {e}")
+
+    # Фоллбек модель
+    classifier = pipeline(
+        "zero-shot-classification",
+        model="distilbert-base-uncased",
+        device=-1  # CPU
+    )
+    logger.info("Fallback classifier initialized: distilbert-base-uncased on CPU")
+    print("Fallback classifier initialized: distilbert-base-uncased on CPU")
+
 
 # Initialize SQLite database
 def init_db():
