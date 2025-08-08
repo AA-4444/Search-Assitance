@@ -14,60 +14,52 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 
-# ========== Optional: Telegram (disabled by default in Railway) ==========
+# ========= Feature flags / API keys =========
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 if TELEGRAM_ENABLED:
     from telethon.sync import TelegramClient
     from telethon.tl.functions.contacts import SearchRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
-# ========== SerpAPI ==========
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 
-# ========== Flask App / CORS ==========
+# ========= Flask app + CORS =========
 app = Flask(__name__, template_folder=os.getenv("TEMPLATE_FOLDER", "templates"))
 
-# Явно разрешаем localhost и твой Railway-домен. Этого достаточно для дев/прода.
-CORS(
-    app,
-    origins=[
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "https://search-assistance-production.up.railway.app",
-    ],
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    supports_credentials=True,
-)
-
+# Разрешаем дев и прод-ориджины
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
     "http://127.0.0.1:8080",
     "https://search-assistance-production.up.railway.app",
 }
+CORS(
+    app,
+    origins=list(ALLOWED_ORIGINS),
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    supports_credentials=True,
+)
 
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
     if origin in ALLOWED_ORIGINS:
-        # базовые
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
-        # preflight
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        # (опционально) сколько кэшировать preflight
         resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
-# и убедись, что preflight обрабатывается:
-@app.route("/search", methods=["POST", "OPTIONS"])
-def search():
-    if request.method == "OPTIONS":
-        return "", 204
+@app.route("/")
+def index():
+    try:
+        return render_template("index.html")
+    except Exception:
+        return "Backend is running."
 
-# ========== Logging ==========
+# ========= Logging =========
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -75,24 +67,24 @@ handler = logging.FileHandler("scraper.log", encoding="utf-8") if LOG_TO_FILE el
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
 
-# ========== Limits / pauses ==========
+# ========= Limits / pauses =========
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
 REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.8"))
 REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 
-# ========== Proxy config ==========
+# ========= Proxy config =========
 PROXY_CACHE_FILE = "proxies.json"
 PROXY_API_URL = "https://www.proxy-list.download/api/v1/get?type=https&anon=elite"
 MAX_PROXY_ATTEMPTS = int(os.getenv("MAX_PROXY_ATTEMPTS", "2"))
 
-# ========== Telegram creds (only if enabled) ==========
+# ========= Telegram creds (if enabled) =========
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0")) if TELEGRAM_ENABLED else 0
 API_HASH = os.getenv("TELEGRAM_API_HASH", "") if TELEGRAM_ENABLED else ""
 PHONE_NUMBER = os.getenv("TELEGRAM_PHONE") if TELEGRAM_ENABLED else None
 TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD") if TELEGRAM_ENABLED else None
 
-# ========== Classifier (CPU by default) ==========
+# ========= Classifier (CPU) =========
 def init_classifier():
     model_main = os.getenv("CLASSIFIER_MODEL", "facebook/bart-large-mnli")
     model_fallback = os.getenv("CLASSIFIER_FALLBACK", "distilbert-base-uncased")
@@ -113,7 +105,7 @@ def init_classifier():
 
 classifier = init_classifier()
 
-# ========== DB Init ==========
+# ========= DB =========
 def init_db():
     try:
         with sqlite3.connect("search_results.db") as conn:
@@ -137,7 +129,7 @@ def init_db():
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
 
-# ========== Helpers ==========
+# ========= Helpers =========
 def load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
@@ -148,8 +140,7 @@ def load_request_count():
                 if last_reset_date.date() < datetime.now().date():
                     return {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
             return data
-    except Exception as e:
-        logger.error(f"Error loading request count: {e}")
+    except Exception:
         return {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
 
 def save_request_count(count):
@@ -179,8 +170,7 @@ def fetch_free_proxies():
     try:
         response = requests.get(PROXY_API_URL, timeout=10)
         response.raise_for_status()
-        proxy_list = response.text.strip().split("\n")
-        for proxy in proxy_list:
+        for proxy in response.text.strip().split("\n"):
             if ":" in proxy:
                 proxies.append({"https": f"https://{proxy}"})
         save_proxies(proxies)
@@ -237,7 +227,7 @@ def analyze_result(description, prompt_phrases):
     if not classifier:
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
-    labels = [p.title() for p in prompt_phrases[:3]] + ["Social Media", "Other"] or ["Relevant","Other"]
+    labels = [p.title() for p in prompt_phrases[:3]] + ["Social Media", "Other"] or ["Relevant", "Other"]
     try:
         result = classifier(cleaned, candidate_labels=labels, multi_label=False)
         is_rel = (result["labels"][0] != "Other") or any(w in cleaned for w in words) or any(p.lower() in cleaned for p in prompt_phrases)
@@ -249,7 +239,7 @@ def analyze_result(description, prompt_phrases):
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
-# ========== Query generation ==========
+# ========= Query generation =========
 def generate_search_queries(prompt, region="wt-wt"):
     valid = ["wt-wt","ua-ua","ru-ru","us-en","de-de","fr-fr","uk-en"]
     prompt = (prompt or "").strip()
@@ -261,7 +251,7 @@ def generate_search_queries(prompt, region="wt-wt"):
         return [prompt], [], region, [prompt]
     return [prompt], phrases, region, [prompt]
 
-# ========== DuckDuckGo ==========
+# ========= DuckDuckGo =========
 def duckduckgo_search(query, max_results=15, region="wt-wt"):
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
@@ -283,7 +273,7 @@ def duckduckgo_search(query, max_results=15, region="wt-wt"):
         logger.error(f"DDG failed for '{query}': {e}")
         return []
 
-# ========== SerpAPI ==========
+# ========= SerpAPI =========
 REGION_MAP = {
     "wt-wt": {"hl": "en", "gl": "us"},
     "ua-ua": {"hl": "uk", "gl": "ua"},
@@ -315,7 +305,7 @@ def serpapi_search(query, max_results=15, region="wt-wt"):
         logger.error(f"SerpAPI failed for '{query}': {e}")
         return []
 
-# ========== Telegram ==========
+# ========= Telegram =========
 def telegram_search(queries, prompt_phrases):
     if not TELEGRAM_ENABLED:
         logger.info("Telegram search disabled")
@@ -377,7 +367,7 @@ def telegram_search(queries, prompt_phrases):
         logger.error(f"Telegram client failed: {e}")
     return results
 
-# ========== Core scraping ==========
+# ========= Scraper =========
 def search_and_scrape_websites(urls, prompt_phrases):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
@@ -519,7 +509,7 @@ def save_to_txt():
     except Exception as e:
         logger.error(f"Error saving to TXT: {e}")
 
-# ========== API ==========
+# ========= API =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     # Preflight
@@ -559,7 +549,7 @@ def search():
             )
             conn.commit()
 
-        # Generate & collect URLs
+        # Build & collect URLs
         web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(query, region)
         all_urls = []
         for q in web_queries:
@@ -573,7 +563,7 @@ def search():
         # Scrape
         web_results = search_and_scrape_websites(all_urls, prompt_phrases)
 
-        # Telegram
+        # Telegram (optional)
         telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
         all_results = web_results + telegram_results
         all_results.sort(key=lambda x: x["score"], reverse=True)
@@ -605,7 +595,7 @@ def download_file(filetype):
     except Exception as e:
         return jsonify({"error": f"Error downloading {filename}: {str(e)}"}), 500
 
-# ========== Entry ==========
+# ========= Entry =========
 if __name__ == "__main__":
     init_db()
     host = os.getenv("HOST", "0.0.0.0")
