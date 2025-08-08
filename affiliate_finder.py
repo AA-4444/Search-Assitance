@@ -26,7 +26,6 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 # ========= Flask app + CORS =========
 app = Flask(__name__, template_folder=os.getenv("TEMPLATE_FOLDER", "templates"))
 
-# Разрешаем дев и прод-ориджины
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
     "http://127.0.0.1:8080",
@@ -51,13 +50,6 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
-
-@app.route("/")
-def index():
-    try:
-        return render_template("index.html")
-    except Exception:
-        return "Backend is running."
 
 # ========= Logging =========
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
@@ -197,7 +189,7 @@ def is_relevant_url(url, prompt_phrases):
     irrelevant = [
         "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
         "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
-        "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
+        "linguee.com","bab.la","reverso.net","sinonим.org","wordhippo.com","microsoft.com",
         "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx"
     ]
     u = (url or "").lower()
@@ -509,19 +501,27 @@ def save_to_txt():
     except Exception as e:
         logger.error(f"Error saving to TXT: {e}")
 
-# ========= API =========
+# ========= API (единственный маршрут /search) =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
-    # Preflight
     if request.method == "OPTIONS":
-        return "", 204
+        resp = app.make_default_options_response()
+        origin = request.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
 
     try:
         data = request.json or {}
         query = data.get("query", "")
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
         max_results = int(data.get("max_results", 15))
 
         if not query:
