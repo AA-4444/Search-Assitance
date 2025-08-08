@@ -30,9 +30,15 @@ ENV SEARCH_ENGINE=both
 ENV CLASSIFIER_DEVICE=-1
 ENV LOG_TO_FILE=false
 ENV TELEGRAM_ENABLED=false
-# чуть аккуратнее с памятью на Railway
 ENV TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 ENV HF_HUB_DISABLE_TELEMETRY=1
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:${PORT}", "--workers", "1", "--threads", "8", "--timeout", "120"]
+CMD sh -c 'gunicorn affiliate_finder:app \
+  --bind 0.0.0.0:${PORT:-5000} \
+  --workers ${WEB_CONCURRENCY:-1} \
+  --threads ${GUNICORN_THREADS:-8} \
+  --timeout ${GUNICORN_TIMEOUT:-120} \
+  --access-logfile - \
+  --error-logfile -'
+
 
