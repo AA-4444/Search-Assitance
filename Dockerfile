@@ -27,9 +27,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY . .
 
-# Copy Telegram session file if it exists (optional)
-COPY session_name.session . 2>/dev/null || true
-
 ENV PYTHONUNBUFFERED=1
 
 CMD gunicorn -w 2 -b 0.0.0.0:$PORT affiliate_finder:app
