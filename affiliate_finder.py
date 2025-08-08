@@ -21,11 +21,18 @@ from datetime import datetime
 
 # Setup Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests from frontend
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for testing
 
 @app.route('/')
 def index():
     return render_template('index.html')
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health():
+    logger.info("Health check endpoint accessed")
+    print("Health check endpoint accessed")
+    return jsonify({"status": "healthy", "message": "Server is running"}), 200
 
 # Setup logging with UTF-8 encoding
 logging.basicConfig(
@@ -341,6 +348,12 @@ def telegram_search(queries, prompt_phrases):
     if not all([api_id, api_hash, phone_number]):
         logger.error("Missing Telegram credentials, skipping Telegram search")
         print("Missing Telegram credentials, skipping Telegram search")
+        return results
+    
+    session_file = "session_name.session"
+    if not os.path.exists(session_file):
+        logger.error(f"Telegram session file {session_file} not found, skipping Telegram search")
+        print(f"Telegram session file {session_file} not found, skipping Telegram search")
         return results
     
     try:
