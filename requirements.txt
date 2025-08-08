@@ -1,9 +1,10 @@
-requests==2.32.3
-beautifulsoup4==4.12.3
-transformers==4.44.2
-torch==2.4.1
-duckduckgo_search==6.3.0
+flask==2.3.3
+flask-cors==4.0.1
+requests==2.31.0
+beautifulsoup4==4.12.2
+sqlite3
+transformers==4.35.2
+torch==2.1.0
+python-ddgs==0.1.0
 telethon==1.36.0
-flask==3.0.3
-flask-cors==5.0.0
 gunicorn==23.0.0

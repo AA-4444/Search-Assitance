@@ -1,1 +1,1 @@
-web: gunicorn -w 2 -b 0.0.0.0:$PORT affiliate_finder:app
+web: gunicorn affiliate_finder:app
