@@ -17,7 +17,6 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 import torch
-import fcntl  # For file locking on Unix-like systems (Railway)
 from datetime import datetime
 
 # Setup Flask app
@@ -37,120 +36,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Track API requests
-REQUEST_COUNT_FILE = "request_count.json"
-DAILY_REQUEST_LIMIT = 100  # Adjust based on SerpAPI plan (free tier: 100 searches/month)
+# In-memory request count
+request_data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+DAILY_REQUEST_LIMIT = 100  # Adjust based on SerpAPI plan
 REQUEST_PAUSE_MIN = 0.5
 REQUEST_PAUSE_MAX = 1
 
-# Proxy settings for DuckDuckGo
-PROXY_CACHE_FILE = "proxies.json"
-PROXY_API_URL = "https://www.proxy-list.download/api/v1/get?type=https&anon=elite"
-MAX_PROXY_ATTEMPTS = 3
-
 def load_request_count():
+    global request_data
     try:
-        with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
-            data = json.load(f)
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
-            last_reset = data.get("last_reset", "")
-            if last_reset:
-                last_reset_date = datetime.strptime(last_reset, "%Y-%m-%d")
-                if last_reset_date.date() < datetime.now().date():
-                    data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
-                    save_request_count(0)  # Create the file with default values
-            return data
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
-        save_request_count(0)
-        logger.info(f"Created new {REQUEST_COUNT_FILE} with count=0")
-        print(f"Created new {REQUEST_COUNT_FILE} with count=0")
-        return data
+        last_reset = request_data.get("last_reset", "")
+        if last_reset:
+            last_reset_date = datetime.strptime(last_reset, "%Y-%m-%d")
+            if last_reset_date.date() < datetime.now().date():
+                request_data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+        return request_data
+    except Exception as e:
+        logger.error(f"Failed to load request count: {e}")
+        print(f"Failed to load request count: {e}")
+        request_data = {"count": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+        return request_data
 
 def save_request_count(count):
+    global request_data
     try:
-        with open(REQUEST_COUNT_FILE, "a+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for writing
-            f.seek(0)
-            json.dump({"count": count, "last_reset": datetime.now().strftime("%Y-%m-%d")}, f)
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
+        request_data["count"] = count
+        request_data["last_reset"] = datetime.now().strftime("%Y-%m-%d")
+        logger.info(f"Updated request count: {count}")
+        print(f"Updated request count: {count}")
     except Exception as e:
         logger.error(f"Failed to save request count: {e}")
         print(f"Failed to save request count: {e}")
 
-def load_proxies():
-    try:
-        with open(PROXY_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        logger.info(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
-        print(f"{PROXY_CACHE_FILE} not found, initializing empty proxy list")
-        return []
+# Global classifier
+classifier = None
 
-def save_proxies(proxies):
+def init_classifier():
+    global classifier
     try:
-        with open(PROXY_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(proxies, f)
+        if torch.cuda.is_available():
+            device = 0  # CUDA
+        elif torch.backends.mps.is_available():
+            device = "mps"  # Apple GPU
+        else:
+            device = -1  # CPU
+        classifier = pipeline(
+            "zero-shot-classification",
+            model="facebook/bart-large-mnli",
+            device=device,
+            clean_up_tokenization_spaces=True
+        )
+        logger.info(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
+        print(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
     except Exception as e:
-        logger.error(f"Failed to save proxies: {e}")
-        print(f"Failed to save proxies: {e}")
-
-def fetch_free_proxies():
-    logger.info("Fetching free proxies from API")
-    print("Fetching free proxies from API")
-    proxies = []
-    try:
-        response = requests.get(PROXY_API_URL, timeout=10)
-        response.raise_for_status()
-        proxy_list = response.text.strip().split("\n")
-        for proxy in proxy_list:
-            if ":" in proxy:
-                proxies.append({"https": f"https://{proxy}"})
-        save_proxies(proxies)
-        logger.info(f"Fetched {len(proxies)} proxies")
-        print(f"Fetched {len(proxies)} proxies")
-        return proxies
-    except Exception as e:
-        logger.error(f"Failed to fetch proxies: {e}")
-        print(f"Failed to fetch proxies: {e}")
-        return []
-
-def get_proxy():
-    proxies = load_proxies()
-    if not proxies:
-        proxies = fetch_free_proxies()
-    return random.choice(proxies) if proxies else None
-
-# Setup classifier
-try:
-    if torch.cuda.is_available():
-        device = 0  # CUDA
-    elif torch.backends.mps.is_available():
-        device = "mps"  # Apple GPU
-    else:
-        device = -1  # CPU
-
-    classifier = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli",
-        device=device,
-        clean_up_tokenization_spaces=True
-    )
-    logger.info(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
-    print(f"Classifier initialized: facebook/bart-large-mnli on device {device}")
-
-except Exception as e:
-    logger.error(f"Failed to initialize facebook/bart-large-mnli: {e}")
-    print(f"Failed to initialize facebook/bart-large-mnli: {e}")
-    classifier = pipeline(
-        "zero-shot-classification",
-        model="distilbert-base-uncased",
-        device=-1,
-        clean_up_tokenization_spaces=True
-    )
-    logger.info("Fallback classifier initialized: distilbert-base-uncased on CPU")
-    print("Fallback classifier initialized: distilbert-base-uncased on CPU")
+        logger.error(f"Failed to initialize facebook/bart-large-mnli: {e}")
+        print(f"Failed to initialize facebook/bart-large-mnli: {e}")
+        classifier = pipeline(
+            "zero-shot-classification",
+            model="distilbert-base-uncased",
+            device=-1,
+            clean_up_tokenization_spaces=True
+        )
+        logger.info("Fallback classifier initialized: distilbert-base-uncased on CPU")
+        print("Fallback classifier initialized: distilbert-base-uncased on CPU")
 
 # Initialize SQLite database
 def init_db():
@@ -335,7 +283,7 @@ def serpapi_search(query, max_results=5, region="wt-wt"):
     print(f"Max retries reached for SerpAPI query {query}, falling back to DuckDuckGo")
     return "max_retries", []
 
-# DuckDuckGo search with proxies and retry logic
+# DuckDuckGo search without proxies
 def duckduckgo_search(query, max_results=5, region="wt-wt"):
     request_data = load_request_count()
     request_count = request_data["count"]
@@ -349,61 +297,33 @@ def duckduckgo_search(query, max_results=5, region="wt-wt"):
     print(f"Performing DuckDuckGo search for query: {query}, region: {region}, max_results: {max_results}")
     urls = []
     
-    retries = 3
-    backoff_factor = 1  # Initial wait of 1 second, doubles each retry
-    proxy_attempts = 0
-    proxies_used = []
-    
-    while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-        proxy = get_proxy() if proxy_attempts > 0 else None
-        if proxy and proxy in proxies_used:
-            logger.warning("No more unique proxies available")
-            print("No more unique proxies available")
-            break
-        if proxy:
-            proxies_used.append(proxy)
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(
+                query,
+                region=region,
+                safesearch="moderate",
+                timelimit="y",
+                max_results=max_results
+            )
+            for result in results:
+                url = result.get("href")
+                if url:
+                    urls.append(url)
+                    logger.info(f"Found URL: {url}")
+                    print(f"Found URL: {url}")
         
-        for attempt in range(retries):
-            try:
-                with DDGS(proxies=proxy) as ddgs:
-                    results = ddgs.text(
-                        query,
-                        region=region,
-                        safesearch="moderate",
-                        timelimit="y",
-                        max_results=max_results
-                    )
-                    for result in results:
-                        url = result.get("href")
-                        if url:
-                            urls.append(url)
-                            logger.info(f"Found URL: {url}, Proxy: {proxy}")
-                            print(f"Found URL: {url}, Proxy: {proxy}")
-                
-                request_count += 1
-                save_request_count(request_count)
-                logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-                print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
-                
-                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-                return list(set(urls))[:max_results]
-            except Exception as e:
-                if "202 Ratelimit" in str(e):
-                    wait_time = backoff_factor * (2 ** attempt)
-                    logger.warning(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
-                    print(f"Rate limit hit for query {query}, retrying in {wait_time} seconds (attempt {attempt + 1}/{retries}, proxy: {proxy})")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
-                    print(f"DuckDuckGo search failed for query {query}: {e}, proxy: {proxy}")
-                    break
-        proxy_attempts += 1
-        logger.warning(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
-        print(f"Retrying with new proxy (attempt {proxy_attempts}/{MAX_PROXY_ATTEMPTS})")
-    
-    logger.warning(f"Max retries and proxies reached for query {query}, returning empty results")
-    print(f"Max retries and proxies reached for query {query}, returning empty results")
-    return []
+        request_count += 1
+        save_request_count(request_count)
+        logger.info(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+        print(f"Request count: {request_count}/{DAILY_REQUEST_LIMIT}")
+        
+        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+        return list(set(urls))[:max_results]
+    except Exception as e:
+        logger.error(f"DuckDuckGo search failed for query {query}: {e}")
+        print(f"DuckDuckGo search failed for query {query}: {e}")
+        return []
 
 # Telegram search
 def telegram_search(queries, prompt_phrases):
@@ -414,33 +334,24 @@ def telegram_search(queries, prompt_phrases):
         print("No Telegram queries provided, skipping Telegram search")
         return results
     
-    # Check for Telegram credentials
     api_id = os.environ.get("TELEGRAM_API_ID")
     api_hash = os.environ.get("TELEGRAM_API_HASH")
     phone_number = os.environ.get("TELEGRAM_PHONE_NUMBER")
     
     if not all([api_id, api_hash, phone_number]):
-        logger.error("Missing Telegram credentials (TELEGRAM_API_ID, TELEGRAM_API_HASH, or TELEGRAM_PHONE_NUMBER), skipping Telegram search")
+        logger.error("Missing Telegram credentials, skipping Telegram search")
         print("Missing Telegram credentials, skipping Telegram search")
         return results
     
     try:
-        api_id = int(api_id)  # Convert to int here to avoid TypeError
+        api_id = int(api_id)
         client = TelegramClient("session_name", api_id, api_hash)
         client.connect()
         
         if not client.is_user_authorized():
-            try:
-                client.send_code_request(phone_number)
-                code = input("Please enter the code you received: ")
-                client.sign_in(phone_number, code)
-            except SessionPasswordNeededError:
-                password = input("Введите пароль для двухфакторной аутентификации: ")
-                client.sign_in(password=password)
-            except Exception as e:
-                logger.error(f"Telegram authentication failed: {e}")
-                print(f"Telegram authentication failed: {e}")
-                return results
+            logger.error("Telegram session not authorized, please authenticate locally first")
+            print("Telegram session not authorized, please authenticate locally first")
+            return results
         
         for query in queries:
             logger.info(f"Searching Telegram for query: {query}")
@@ -530,101 +441,68 @@ def search_and_scrape_websites(queries, prompt_phrases, max_results=5, region="w
         for i, url in enumerate(urls, 1):
             logger.info(f"Scraping URL {i}/{total_urls}: {url}")
             print(f"Scraping URL {i}/{total_urls}: {url}")
-            proxy_attempts = 0
-            proxies_used = []
-            success = False
-            
-            while proxy_attempts <= MAX_PROXY_ATTEMPTS:
-                proxy = get_proxy()
-                if proxy and proxy in proxies_used:
-                    logger.warning(f"No more unique proxies available for {url}")
-                    print(f"No more unique proxies available for {url}")
-                    break
-                if proxy:
-                    proxies_used.append(proxy)
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
+                response = requests.get(url, headers=headers, timeout=10, verify=False)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, "html.parser")
                 
-                try:
-                    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"}
-                    response = requests.get(url, headers=headers, timeout=10, verify=False, proxies=proxy)
-                    response.raise_for_status()
-                    soup = BeautifulSoup(response.content, "html.parser")
-                    
-                    name_selectors = ["h1[class*='brand'], h1[class*='partner'], .company-name, .brand-name, .site-title, .logo-text, title, h1, .header-title"]
-                    description_selectors = [".description, .about, .content, .intro, div[class*='about'], section[class*='program'], p[class*='description'], meta[name='description'], div[class*='overview'], p"]
-                    country_selectors = [".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info"]
-                    
-                    name = None
-                    for selector in name_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            name = clean_description(element.text)
-                            if len(name) > 5:
-                                break
-                    name = name or "N/A"
-                    
-                    description = None
-                    for selector in description_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            description = clean_description(element.get("content") if element.get("content") else element.text)
-                            if len(description) > 10:
-                                break
-                    description = description or "N/A"
-                    
-                    country = None
-                    for selector in country_selectors:
-                        element = soup.select_one(selector)
-                        if element:
-                            country = clean_description(element.text)
-                            if len(country) > 2:
-                                break
-                    country = country or "N/A"
-                    
-                    is_relevant, specialization, status, suitability = analyze_result(description, prompt_phrases)
-                    score = rank_result(description, prompt_phrases)
-                    source = "SerpAPI" if url in serp_urls else "DuckDuckGo"
-                    if is_relevant_url(url, prompt_phrases) or score > 0.1:
-                        result = {
-                            "id": str(uuid.uuid4()),
-                            "name": name,
-                            "website": url,
-                            "description": description,
-                            "country": country,
-                            "source": source,
-                            "score": score
-                        }
-                        results.append(result)
-                        logger.info(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}, Proxy={proxy}")
-                        print(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}, Proxy={proxy}")
-                        save_to_db(result, is_relevant, specialization, status, suitability, score)
-                    else:
-                        logger.info(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}, Proxy={proxy}")
-                        print(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}, Proxy={proxy}")
-                    
-                    success = True
-                    time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-                    break
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if any(err in error_str for err in ["403", "429", "connection", "timeout", "ssl"]):
-                        logger.warning(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
-                        print(f"Error for {url}: {e}, attempting with proxy (attempt {proxy_attempts + 1})")
-                        proxy_attempts += 1
-                        if proxy_attempts > MAX_PROXY_ATTEMPTS:
-                            logger.warning(f"Max proxy attempts reached for {url}, skipping")
-                            print(f"Max proxy attempts reached for {url}, skipping")
+                name_selectors = ["h1[class*='brand'], h1[class*='partner'], .company-name, .brand-name, .site-title, .logo-text, title, h1, .header-title"]
+                description_selectors = [".description, .about, .content, .intro, div[class*='about'], section[class*='program'], p[class*='description'], meta[name='description'], div[class*='overview'], p"]
+                country_selectors = [".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info"]
+                
+                name = None
+                for selector in name_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        name = clean_description(element.text)
+                        if len(name) > 5:
                             break
-                    else:
-                        logger.error(f"Scraping failed for {url}: {e}, skipping")
-                        print(f"Scraping failed for {url}: {e}, skipping")
-                        break
+                name = name or "N/A"
                 
-                if success:
-                    break
-            
-            if not success:
-                logger.warning(f"Failed to scrape {url} after all attempts")
-                print(f"Failed to scrape {url} after all attempts")
+                description = None
+                for selector in description_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        description = clean_description(element.get("content") if element.get("content") else element.text)
+                        if len(description) > 10:
+                            break
+                description = description or "N/A"
+                
+                country = None
+                for selector in country_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        country = clean_description(element.text)
+                        if len(country) > 2:
+                            break
+                country = country or "N/A"
+                
+                is_relevant, specialization, status, suitability = analyze_result(description, prompt_phrases)
+                score = rank_result(description, prompt_phrases)
+                source = "SerpAPI" if url in serp_urls else "DuckDuckGo"
+                if is_relevant_url(url, prompt_phrases) or score > 0.1:
+                    result = {
+                        "id": str(uuid.uuid4()),
+                        "name": name,
+                        "website": url,
+                        "description": description,
+                        "country": country,
+                        "source": source,
+                        "score": score
+                    }
+                    results.append(result)
+                    logger.info(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}")
+                    print(f"Scraped: Name={name[:50]}, Website={url}, Classified as Relevant ({specialization}), Score={score}, Source={source}")
+                    save_to_db(result, is_relevant, specialization, status, suitability, score)
+                else:
+                    logger.info(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}")
+                    print(f"Skipped: Name={name[:50]}, Website={url}, Not Relevant (Score={score}), Source={source}")
+                
+                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+            except Exception as e:
+                logger.error(f"Scraping failed for {url}: {e}")
+                print(f"Scraping failed for {url}: {e}")
     
     results.sort(key=lambda x: x["score"], reverse=True)
     logger.info(f"Total web results scraped: {len(results)}")
@@ -705,9 +583,13 @@ def save_to_txt():
 def search():
     try:
         data = request.json
+        logger.info(f"Raw request data: {data}")
         query = data.get('query', '')
         region = data.get('region', 'wt-wt')
         use_telegram = data.get('telegram', False)
+        
+        logger.info(f"Parsed query: {query}, region: {region}, telegram: {use_telegram}")
+        print(f"Parsed query: {query}, region: {region}, telegram: {use_telegram}")
         
         if not query:
             return jsonify({"error": "Query is required", "results": [], "telegram_enabled": use_telegram, "region": region, "message": "No query provided"}), 400
@@ -758,10 +640,12 @@ def search():
             "region": region,
             "message": "No results found, possibly due to rate limits or no matching content" if not all_results else "Search completed successfully"
         }
+        logger.info(f"Search response: {response['message']}, results count: {len(all_results)}")
+        print(f"Search response: {response['message']}, results count: {len(all_results)}")
         return jsonify(response)
     except Exception as e:
-        logger.error(f"API error: {e}")
-        print(f"API error: {e}")
+        logger.error(f"API error: {e}", exc_info=True)
+        print(f"API error: {e}", exc_info=True)
         return jsonify({"error": str(e), "results": [], "telegram_enabled": use_telegram, "region": region, "message": "Search failed due to an error"}), 500
 
 @app.route('/download/<filetype>', methods=['GET'])
@@ -784,7 +668,8 @@ def download_file(filetype):
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5002))
+    init_classifier()
+    port = int(os.environ.get("PORT", 8080))
     print(f"Starting Flask server on http://0.0.0.0:{port} (Press CTRL+C to quit)", flush=True)
     try:
         app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
