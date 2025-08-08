@@ -40,12 +40,32 @@ CORS(
     supports_credentials=True,
 )
 
-@app.route("/")
-def index():
-    try:
-        return render_template("index.html")
-    except Exception:
-        return "Backend is running."
+ALLOWED_ORIGINS = {
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "https://search-assistance-production.up.railway.app",
+}
+
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        # базовые
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        # preflight
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        # (опционально) сколько кэшировать preflight
+        resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+# и убедись, что preflight обрабатывается:
+@app.route("/search", methods=["POST", "OPTIONS"])
+def search():
+    if request.method == "OPTIONS":
+        return "", 204
 
 # ========== Logging ==========
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
