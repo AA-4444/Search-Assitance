@@ -19,7 +19,6 @@ from flask_cors import CORS
 CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 def clean_text(text: str) -> str:
-    """Убираем ```json...```, крайние кавычки/апострофы и лишние крайние скобки."""
     if not text:
         return ""
     t = text.strip()
@@ -30,7 +29,6 @@ def clean_text(text: str) -> str:
     return t
 
 def clean_description(description):
-    """Убираем HTML и сокращаем до ~200 слов."""
     if not description:
         return "N/A"
     soup = BeautifulSoup(str(description), "html.parser")
@@ -58,7 +56,7 @@ if TELEGRAM_ENABLED:
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # укажи в Railway
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -345,7 +343,6 @@ GEO_HINTS: Dict[str, Dict[str, Any]] = {
 }
 
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
-    """Добавляем к первым подзапросам страновой контекст и site:.tld."""
     hint = GEO_HINTS.get(region)
     if not hint:
         return queries
@@ -564,20 +561,27 @@ def telegram_search(queries, prompt_phrases):
         client.connect()
         if not client.is_user_authorized():
             try:
-                client.send_code_request(PHONE_NUMBER)
+                # 1) если заранее положили TELEGRAM_LOGIN_CODE — используем
                 code = os.getenv("TELEGRAM_LOGIN_CODE")
-                if not code:
-                    logger.error("TELEGRAM_LOGIN_CODE not provided")
+                if code:
+                    client.sign_in(PHONE_NUMBER, code)
+                else:
+                    # 2) иначе инициируем отправку кода (для удобства)
+                    client.send_code_request(PHONE_NUMBER)
+                    logger.warning("Telegram requires login. Call /api/telegram/complete_login with the code.")
+                    client.disconnect()
                     return results
-                client.sign_in(PHONE_NUMBER, code)
             except SessionPasswordNeededError:
                 if not TELEGRAM_2FA_PASSWORD:
                     logger.error("2FA enabled but TELEGRAM_2FA_PASSWORD not set")
+                    client.disconnect()
                     return results
                 client.sign_in(password=TELEGRAM_2FA_PASSWORD)
             except Exception as e:
                 logger.error(f"Telegram auth failed: {e}")
+                client.disconnect()
                 return results
+
         for q in queries:
             logger.info(f"Searching Telegram for: {q}")
             try:
@@ -600,7 +604,6 @@ def telegram_search(queries, prompt_phrases):
                                 "score": score,
                             }
                             results.append(row)
-                            # Сохраняем в БД с базовыми полями
                             save_to_db(row, is_rel, spec, status, suit, score)
                         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
             except FloodWaitError as e:
@@ -773,6 +776,61 @@ def prefer_country_results(rows: List[dict], region: str) -> List[dict]:
     b = [r for r in rows if not domain_of(r.get("website","")).endswith(tld)]
     return a + b
 
+# ========= API: Telegram bootstrap (первый логин) =========
+@app.route("/api/telegram/send_code", methods=["POST"])
+def telegram_send_code():
+    if not TELEGRAM_ENABLED:
+        return jsonify({"ok": False, "msg": "TELEGRAM_ENABLED=false"}), 400
+    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
+    if not (API_ID and API_HASH and PHONE_NUMBER):
+        return jsonify({"ok": False, "msg": "Missing TELEGRAM_* envs"}), 400
+    try:
+        client = TelegramClient("session_name", API_ID, API_HASH)
+        client.connect()
+        if client.is_user_authorized():
+            client.disconnect()
+            return jsonify({"ok": True, "msg": "Already authorized"})
+        client.send_code_request(PHONE_NUMBER)
+        client.disconnect()
+        return jsonify({"ok": True, "msg": "Code sent to Telegram"})
+    except Exception as e:
+        logger.error(f"/telegram/send_code error: {e}")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+@app.route("/api/telegram/complete_login", methods=["POST"])
+def telegram_complete_login():
+    if not TELEGRAM_ENABLED:
+        return jsonify({"ok": False, "msg": "TELEGRAM_ENABLED=false"}), 400
+    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
+    data = request.json or {}
+    code = (data.get("code") or "").strip()
+    password = data.get("password")
+    if not (API_ID and API_HASH and PHONE_NUMBER and code):
+        return jsonify({"ok": False, "msg": "Missing API_ID/API_HASH/PHONE or code"}), 400
+    try:
+        client = TelegramClient("session_name", API_ID, API_HASH)
+        client.connect()
+        if client.is_user_authorized():
+            client.disconnect()
+            return jsonify({"ok": True, "msg": "Already authorized"})
+        try:
+            client.sign_in(PHONE_NUMBER, code)
+        except SessionPasswordNeededError:
+            pwd = password or os.getenv("TELEGRAM_2FA_PASSWORD")
+            if not pwd:
+                client.disconnect()
+                return jsonify({"ok": False, "msg": "2FA enabled. Provide 'password'"}), 401
+            client.sign_in(password=pwd)
+        client.disconnect()
+        return jsonify({"ok": True, "msg": "Telegram authorized"})
+    except Exception as e:
+        logger.error(f"/telegram/complete_login error: {e}")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
 # ========= API =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
@@ -793,7 +851,7 @@ def search():
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
         max_results = int(data.get("max_results", 15))
 
         if not user_query:
@@ -821,9 +879,16 @@ def search():
             )
             conn.commit()
 
-        # Build & collect URLs
+        # Build queries
         web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(user_query, region)
 
+        # === Telegram warmup/search (раньше, чтобы авторизация произошла сразу)
+        telegram_results = []
+        if use_telegram:
+            logger.info("Telegram warmup/search starting early...")
+            telegram_results = telegram_search(telegram_queries, prompt_phrases)
+
+        # Collect URLs from engines
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
@@ -837,11 +902,10 @@ def search():
         # Scrape
         web_results = search_and_scrape_websites(all_urls, prompt_phrases, region)
 
-        # Telegram (optional)
-        telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
-        all_results = web_results + telegram_results
+        # Combine results
+        all_results = web_results + (telegram_results if use_telegram else [])
 
-        # Hard cleanup pass
+        # Hard cleanup
         filtered = []
         for r in all_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
@@ -903,6 +967,11 @@ def serve_frontend(path):
     if os.path.exists(index_path):
         return send_from_directory(FRONTEND_DIST, "index.html")
     return "frontend_dist is missing. Please upload your built frontend.", 404
+
+# ========= Health =========
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True}), 200
 
 # ========= Entry =========
 if __name__ == "__main__":
