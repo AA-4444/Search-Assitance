@@ -1,18 +1,25 @@
 import os
-import requests
-from bs4 import BeautifulSoup
-import sqlite3
-from transformers import pipeline
-import time
-import csv
-import logging
-import uuid
-import random
+import re
 import json
-from ddgs import DDGS
+import time
+import uuid
+import csv
+import random
+import logging
+import sqlite3
+import requests
 from datetime import datetime
+from typing import List, Tuple
+
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+
+# ===== Optional HF pipeline (classifier). If not installed, continue without it.
+try:
+    from transformers import pipeline
+except Exception:
+    pipeline = None
 
 # ========= Feature flags / API keys =========
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
@@ -22,13 +29,7 @@ if TELEGRAM_ENABLED:
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
-
-# Gemini (LLM) — бесплатный gemini-1.5-flash
-GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "true").lower() == "true"
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")  # не хардкодим ключ
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "8.0"))  # сек
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # <= укажи в Railway
 
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,19 +81,29 @@ DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
 REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.8"))
 REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 
+# ========= Search engines & helpers =========
+from ddgs import DDGS
+
+REGION_MAP = {
+    "wt-wt": {"hl": "en", "gl": "us"},
+    "ua-ua": {"hl": "uk", "gl": "ua"},
+    "ru-ru": {"hl": "ru", "gl": "ru"},
+    "us-en": {"hl": "en", "gl": "us"},
+    "de-de": {"hl": "de", "gl": "de"},
+    "fr-fr": {"hl": "fr", "gl": "fr"},
+    "uk-en": {"hl": "en", "gl": "gb"},
+}
+
 # ========= Proxy config =========
 PROXY_CACHE_FILE = "proxies.json"
 PROXY_API_URL = "https://www.proxy-list.download/api/v1/get?type=https&anon=elite"
 MAX_PROXY_ATTEMPTS = int(os.getenv("MAX_PROXY_ATTEMPTS", "2"))
 
-# ========= Telegram creds (if enabled) =========
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0")) if TELEGRAM_ENABLED else 0
-API_HASH = os.getenv("TELEGRAM_API_HASH", "") if TELEGRAM_ENABLED else ""
-PHONE_NUMBER = os.getenv("TELEGRAM_PHONE") if TELEGRAM_ENABLED else None
-TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD") if TELEGRAM_ENABLED else None
-
-# ========= Classifier (CPU) =========
+# ========= Classifier (optional) =========
 def init_classifier():
+    if pipeline is None:
+        logger.warning("transformers pipeline not available; classifier disabled")
+        return None
     model_main = os.getenv("CLASSIFIER_MODEL", "facebook/bart-large-mnli")
     model_fallback = os.getenv("CLASSIFIER_FALLBACK", "distilbert-base-uncased")
     device = int(os.getenv("CLASSIFIER_DEVICE", "-1"))  # -1 = CPU
@@ -136,7 +147,7 @@ def init_db():
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
 
-# ========= Helpers =========
+# ========= Utility: counters & proxies =========
 def load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
@@ -193,6 +204,43 @@ def get_proxy():
         proxies = fetch_free_proxies()
     return random.choice(proxies) if proxies else None
 
+# ========= Text cleaning & relevance filters =========
+CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+BAD_DOMAINS = {
+    "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
+    "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
+    "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
+    "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
+    "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
+}
+
+SPORTS_TRASH_TOKENS = {
+    "футбол","теннис","биатлон","хокей","баскетбол","волейбол","снукер",
+    "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
+}
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    t = CODE_FENCE_RE.sub("", t)             # убираем ```json ... ```
+    t = t.strip(" \n\t\r\"'`")               # срезаем обрамляющие кавычки/апострофы
+    return t
+
+def domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+def looks_like_sports_garbage(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(tok in t for tok in SPORTS_TRASH_TOKENS)
+
 def clean_description(description):
     if not description:
         return "N/A"
@@ -201,14 +249,8 @@ def clean_description(description):
     return " ".join(text.split()[:200])
 
 def is_relevant_url(url, prompt_phrases):
-    irrelevant = [
-        "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
-        "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
-        "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
-        "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx"
-    ]
     u = (url or "").lower()
-    if any(d in u for d in irrelevant):
+    if any(bad in u for bad in BAD_DOMAINS):
         return False
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
@@ -225,13 +267,15 @@ def rank_result(description, prompt_phrases):
             score += 0.4
     if "t.me" in d or "instagram.com" in d:
         score += 0.2
+    if looks_like_sports_garbage(d):
+        score = min(score, 0.2)
     return min(score, 1.0)
 
 def analyze_result(description, prompt_phrases):
     specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
     cleaned = clean_description(description).lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
-    if not classifier:
+    if classifier is None:
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
     labels = [p.title() for p in prompt_phrases[:3]] + ["Social Media", "Other"] or ["Relevant", "Other"]
@@ -246,122 +290,95 @@ def analyze_result(description, prompt_phrases):
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
-# ========= LLM: расширение запросов через Gemini =========
-def expand_queries_with_gemini(user_prompt: str, region: str):
-    """
-    Возвращает (expanded_queries, phrases, telegram_queries).
-    Если выключен/нет ключа/ошибка — возвращает None, тогда используем fallback.
-    """
-    if not GEMINI_ENABLED or not GEMINI_API_KEY:
-        return None
+# ========= Query generation with Gemini + fallback =========
+def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], List[str]]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
 
-    sys_hint = (
-        "You are a query generator for web search. "
-        "Given a vague user request (possibly in Russian), produce 3-5 concise, high-intent search queries. "
-        "Always add English keywords even if the input is Russian. "
-        "Prefer phrases suitable for Google/DuckDuckGo. "
-        "Return only a JSON array of strings. No extra text."
+    system_instruction = (
+        "Ты помощник для поиска сайтов. Преобразуй запрос пользователя в массив из 4–6 коротких поисковых запросов. "
+        "Добавь синонимы на английском, даже если исходный текст на русском. Не пиши комментарии. "
+        "Верни ТОЛЬКО JSON-массив строк."
     )
-
-    user_text = (
-        f"Region: {region}\n"
-        f"User request: {user_prompt}\n\n"
-        "Generate diverse queries that target official pages, partner programs, affiliate portals, "
-        "and social/contact links (site:, inurl:affiliate, 'partner program', 'affiliate', 'CPA', 'apply')."
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": sys_hint},
-                    {"text": user_text}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 256
-        }
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": system_instruction},
+                {"text": f"Запрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 256}
     }
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    params = {"key": GEMINI_API_KEY}
 
+    r = requests.post(url, params=params, json=body, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    text = ""
     try:
-        r = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-            timeout=GEMINI_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
+        candidates = data.get("candidates", [])
+        if candidates and "content" in candidates[0]:
+            parts = candidates[0]["content"].get("parts", [])
+            if parts and "text" in parts[0]:
+                text = parts[0]["text"]
+    except Exception:
+        pass
 
-        # Извлекаем текст из candidates
-        text = ""
-        for cand in (data.get("candidates") or []):
-            parts = (((cand.get("content") or {}).get("parts")) or [])
-            for p in parts:
-                t = p.get("text")
-                if t:
-                    text += t + "\n"
+    text = clean_text(text)
+    try:
+        arr = json.loads(text)
+        if isinstance(arr, list):
+            arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
+            arr = [x for x in arr if x and len(x) <= 200]
+            if arr:
+                logger.info("Using Gemini for query expansion")
+                return arr[:6], arr[:6]
+    except Exception:
+        pass
 
-        if not text:
-            return None
+    raise RuntimeError("Gemini returned invalid JSON")
 
-        # Ожидаем JSON-массив строк. Если прилетела не-JSON — пробуем простым парсером.
-        queries = None
-        try:
-            queries = json.loads(text)
-            if not isinstance(queries, list):
-                queries = None
-        except Exception:
-            # fallback: берем строки по дефисам/новым строкам/кавычкам
-            lines = [ln.strip("-• \t") for ln in text.splitlines() if ln.strip()]
-            # Оставим 3-5 осмысленных
-            queries = lines[:5]
+def fallback_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], List[str]]:
+    base = user_prompt.strip()
+    en_boost = [
+        "affiliate programs",
+        "partner program application",
+        "affiliate marketing",
+        "referral program",
+        "CPA affiliate",
+        "best affiliate networks",
+    ]
+    lower = base.lower()
+    if any(k in lower for k in ["казино", "гемблинг", "gambling", "casino", "беттинг", "ставки"]):
+        en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
 
-        # Нормализуем и удалим дубли
-        cleaned = []
-        seen = set()
-        for q in queries or []:
-            if isinstance(q, str):
-                qq = q.strip()
-                if qq and qq.lower() not in seen:
-                    cleaned.append(qq)
-                    seen.add(qq.lower())
+    queries = [base] + en_boost
+    queries = list(dict.fromkeys([q for q in queries if q]))
+    logger.info("Using fallback for query expansion")
+    return queries[:6], queries[:6]
 
-        if not cleaned:
-            return None
-
-        # Параллельно сделаем фразы (ключевики) для ранжирования
-        phrases = []
-        for q in cleaned:
-            # Берем несколько слов >3 символов
-            tokens = [w for w in q.replace("|", " ").split() if len(w) > 3]
-            phrases.extend(tokens[:4])
-        phrases = list(dict.fromkeys(phrases))[:12]
-
-        # Для телеги обычно достаточно исходного и 1-2 уточнения
-        telegram_qs = [user_prompt] + cleaned[:2]
-        telegram_qs = list(dict.fromkeys([q for q in telegram_qs if q]))[:3]
-
-        return cleaned, phrases, telegram_qs
-    except Exception as e:
-        logger.warning(f"Gemini expand failed: {e}")
-        return None
-
-# ========= Query generation (fallback) =========
-def generate_search_queries_fallback(prompt, region="wt-wt"):
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str]]:
     valid = ["wt-wt","ua-ua","ru-ru","us-en","de-de","fr-fr","uk-en"]
-    prompt = (prompt or "").strip()
     if region not in valid:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
-    phrases = [p.strip() for p in prompt.split(",") if p.strip()]
-    if not phrases:
-        return [prompt], [], region, [prompt]
-    return [prompt], phrases, region, [prompt]
 
-# ========= DuckDuckGo =========
+    user_prompt = (user_prompt or "").strip()
+    if not user_prompt:
+        return [user_prompt], [], region, [user_prompt]
+
+    try:
+        queries, phrases = gemini_expand_queries(user_prompt, region)
+    except Exception as e:
+        logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
+        queries, phrases = fallback_expand_queries(user_prompt, region)
+
+    telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
+    return queries, phrases, region, telegram_queries
+
+# ========= Search engines (DDG / SerpAPI) =========
 def duckduckgo_search(query, max_results=15, region="wt-wt"):
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
@@ -378,25 +395,15 @@ def duckduckgo_search(query, max_results=15, region="wt-wt"):
                     urls.append(href)
         save_request_count(data["count"] + 1)
         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+        urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
         logger.error(f"DDG failed for '{query}': {e}")
         return []
 
-# ========= SerpAPI =========
-REGION_MAP = {
-    "wt-wt": {"hl": "en", "gl": "us"},
-    "ua-ua": {"hl": "uk", "gl": "ua"},
-    "ru-ru": {"hl": "ru", "gl": "ru"},
-    "us-en": {"hl": "en", "gl": "us"},
-    "de-de": {"hl": "de", "gl": "de"},
-    "fr-fr": {"hl": "fr", "gl": "fr"},
-    "uk-en": {"hl": "en", "gl": "gb"},
-}
-
 def serpapi_search(query, max_results=15, region="wt-wt"):
     if not SERPAPI_API_KEY:
-        logger.warning("SERPAPI_API_KEY is not set; skipping SerpAPI")
+        logger.info("SERPAPI_API_KEY is not set; skipping SerpAPI")
         return []
     params = {"engine": "google", "q": query, "num": max_results, "api_key": SERPAPI_API_KEY}
     params.update(REGION_MAP.get(region, REGION_MAP["wt-wt"]))
@@ -410,6 +417,7 @@ def serpapi_search(query, max_results=15, region="wt-wt"):
             if it.get("link"):
                 urls.append(it["link"])
         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+        urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
         logger.error(f"SerpAPI failed for '{query}': {e}")
@@ -421,6 +429,11 @@ def telegram_search(queries, prompt_phrases):
         logger.info("Telegram search disabled")
         return []
     results = []
+    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
+    TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD")
+
     if not (API_ID and API_HASH and PHONE_NUMBER):
         logger.error("Telegram env not fully configured; skipping")
         return results
@@ -484,6 +497,9 @@ def search_and_scrape_websites(urls, prompt_phrases):
     urls = list(dict.fromkeys(urls))[:50]
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
+        if domain_of(url) in BAD_DOMAINS:
+            logger.info(f"Skip bad domain: {url}")
+            continue
         proxy_attempts = 0
         proxies_used = []
         success = False
@@ -524,6 +540,11 @@ def search_and_scrape_websites(urls, prompt_phrases):
                 if el:
                     country = clean_description(el.text)
 
+                if looks_like_sports_garbage(description):
+                    logger.info(f"Skip sports-like garbage: {url}")
+                    success = True
+                    break
+
                 is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
                 score = rank_result(description, prompt_phrases)
                 if is_relevant_url(url, prompt_phrases) or score > 0.1:
@@ -558,6 +579,7 @@ def search_and_scrape_websites(urls, prompt_phrases):
     logger.info(f"Total web results scraped: {len(results)}")
     return results
 
+# ========= Persistence =========
 def save_to_db(result, is_relevant, specialization, status, suitability, score):
     try:
         with sqlite3.connect("search_results.db") as conn:
@@ -636,30 +658,18 @@ def search():
 
     try:
         data = request.json or {}
-        user_query = data.get("query", "") or ""
+        user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
         max_results = int(data.get("max_results", 15))
 
-        if not user_query.strip():
+        if not user_query:
             return jsonify({"error": "Query is required"}), 400
 
         logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
 
-        # --- Расширяем запрос Gemini (если доступен), иначе fallback
-        gem = expand_queries_with_gemini(user_query, region)
-        if gem:
-            web_queries, prompt_phrases, telegram_queries = gem
-        else:
-            web_queries, prompt_phrases, region, telegram_queries = generate_search_queries_fallback(user_query, region)
-
-        # Подстрахуем: включим оригинальный запрос в пул
-        if user_query not in web_queries:
-            web_queries = [user_query] + web_queries
-        web_queries = list(dict.fromkeys([q for q in web_queries if q]))[:8]  # не больше 8 запросов в сумме
-
-        # Reset DB для каждого запроса
+        # Reset DB for each request
         with sqlite3.connect("search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS results")
@@ -680,13 +690,16 @@ def search():
             conn.commit()
 
         # Build & collect URLs
+        web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(user_query, region)
+
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
                 all_urls.extend(duckduckgo_search(q, max_results=max_results, region=region))
             if engine in ("serpapi", "both"):
                 all_urls.extend(serpapi_search(q, max_results=max_results, region=region))
-        all_urls = list(dict.fromkeys(all_urls))
+
+        all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
         # Scrape
@@ -695,6 +708,19 @@ def search():
         # Telegram (optional)
         telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
         all_results = web_results + telegram_results
+
+        # Hard cleanup pass
+        filtered = []
+        for r in all_results:
+            txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
+            dom = domain_of(r.get("website",""))
+            if dom in BAD_DOMAINS:
+                continue
+            if looks_like_sports_garbage(txt):
+                continue
+            filtered.append(r)
+
+        all_results = filtered
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
         # Exports
@@ -705,8 +731,7 @@ def search():
             "results": all_results,
             "telegram_enabled": use_telegram,
             "region": region,
-            "engine": engine,
-            "expanded_queries": web_queries[:8]  # полезно на фронте для дебага (можно скрыть)
+            "engine": engine
         })
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -750,7 +775,7 @@ def serve_frontend(path):
 if __name__ == "__main__":
     init_db()
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", os.getenv("RAILWAY_PORT", "5000")))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     logger.info(f"Starting Flask on http://{host}:{port} (debug={debug})")
     app.run(host=host, port=port, debug=debug, use_reloader=False)
