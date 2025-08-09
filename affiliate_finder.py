@@ -54,7 +54,6 @@ except Exception:
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 if TELEGRAM_ENABLED:
     from telethon.sync import TelegramClient
-    from telethon.sessions import StringSession
     from telethon.tl.functions.contacts import SearchRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
@@ -444,6 +443,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
+    # Строго просим не добавлять affiliate-термины, если намерение не affiliate
     system_instruction = (
         "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 4–6 коротких запросов по теме. "
         "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
@@ -505,11 +505,14 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
             "CPA affiliate",
             "best affiliate networks",
         ]
+        # iGaming кейс
         lower = base.lower()
         if any(k in lower for k in ["казино","гемблинг","gambling","casino","беттинг","ставки","igaming"]):
             en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
         queries += en_boost
     else:
+        # Обычный бизнес/каталоги без маркетингового мусора
+        # добавим варианты на RU/UK + EN generic
         generic = [
             f"{base} официальный сайт",
             f"{base} каталог",
@@ -521,6 +524,7 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
         ]
         queries += generic
 
+    # remove dups, apply geo bias
     queries = list(dict.fromkeys([q for q in queries if q]))
     queries = apply_geo_bias(queries[:6], region)
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')})")
@@ -555,6 +559,7 @@ NEGATIVE_SITES_FOR_BUSINESS = [
 
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
     if intent.get("business") and not intent.get("learn"):
+        # при поиске компаний стараемся отминусовать обучалки/вики
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS)
         return f"{q} {negatives}".strip()
     return q
@@ -606,67 +611,45 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]
         logger.error(f"SerpAPI failed for '{q}': {e}")
         return []
 
-# ========= Telegram (client helper + endpoints + search) =========
-def get_tg_client():
-    """Создаёт/возвращает Telethon-клиент со строковой сессией (если задана) или сессией-файлом."""
-    if not TELEGRAM_ENABLED:
-        return None, "TELEGRAM_ENABLED is false"
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    if not (API_ID and API_HASH):
-        return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
-
-    string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
-    try:
-        if string_session:
-            client = TelegramClient(StringSession(string_session), API_ID, API_HASH)
-        else:
-            os.makedirs("data", exist_ok=True)
-            client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
-        client.connect()
-        return client, None
-    except Exception as e:
-        return None, f"Failed to init Telegram client: {e}"
-
+# ========= Telegram =========
 def telegram_search(queries, prompt_phrases):
     if not TELEGRAM_ENABLED:
         logger.info("Telegram search disabled")
         return []
-
     results = []
     API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
     API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD", "")
+    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
+    TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD")
 
     if not (API_ID and API_HASH and PHONE_NUMBER):
         logger.error("Telegram env not fully configured; skipping")
         return results
-
-    client, err = get_tg_client()
-    if err:
-        logger.error(err)
-        return results
-
     try:
+        client = TelegramClient("session_name", API_ID, API_HASH)
+        client.connect()
         if not client.is_user_authorized():
-            force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
             try:
-                client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-                logger.info("Telegram code sent. Complete login via /telegram/confirm")
-                client.disconnect()
-                return results
+                client.send_code_request(PHONE_NUMBER)
+                code = os.getenv("TELEGRAM_LOGIN_CODE")
+                if not code:
+                    logger.error("TELEGRAM_LOGIN_CODE not provided")
+                    return results
+                client.sign_in(PHONE_NUMBER, code)
+            except SessionPasswordNeededError:
+                if not TELEGRAM_2FA_PASSWORD:
+                    logger.error("2FA enabled but TELEGRAM_2FA_PASSWORD not set")
+                    return results
+                client.sign_in(password=TELEGRAM_2FA_PASSWORD)
             except Exception as e:
-                logger.error(f"Telegram code request failed: {e}")
-                client.disconnect()
+                logger.error(f"Telegram auth failed: {e}")
                 return results
-
         for q in queries:
             logger.info(f"Searching Telegram for: {q}")
             try:
                 result = client(SearchRequest(q=q, limit=10))
                 for chat in result.chats:
+                    # берём публичные каналы/суперчаты (без мегагрупп, чтобы выдавать паблики/каналы)
                     if hasattr(chat, "megagroup") and not chat.megagroup:
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
@@ -759,11 +742,13 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                 if el:
                     country = clean_description(el.text)
 
+                # Отсекаем спорт-мусор
                 if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
 
+                # Отсекаем обучалки/вики, если ищем компании
                 if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
@@ -952,6 +937,7 @@ def search():
             if looks_like_sports_garbage(txt):
                 continue
             if intent.get("business") and not intent.get("learn") and dom in KNOWLEDGE_DOMAINS:
+                # выкидываем вики/обучалки на финальном шаге тоже
                 continue
             filtered.append(r)
 
@@ -994,115 +980,6 @@ def download_file(filetype):
 @app.route("/api/download/<filetype>", methods=["GET"])
 def api_download(filetype):
     return download_file(filetype)
-
-# ========= Telegram endpoints =========
-@app.route("/telegram/status", methods=["GET"])
-def tg_status():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"enabled": False, "authorized": False, "reason": "TELEGRAM_ENABLED is false"}), 200
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"enabled": True, "authorized": False, "error": err}), 200
-    try:
-        ok = client.is_user_authorized()
-        me = None
-        if ok:
-            me = client.get_me()
-            me = {"id": me.id, "username": getattr(me, "username", None), "phone": getattr(me, "phone", None)}
-        client.disconnect()
-        return jsonify({"enabled": True, "authorized": ok, "me": me}), 200
-    except Exception as e:
-        return jsonify({"enabled": True, "authorized": False, "error": str(e)}), 200
-
-@app.route("/telegram/send_code", methods=["POST"])
-def tg_send_code():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not PHONE_NUMBER:
-        return jsonify({"error": "TELEGRAM_PHONE not set"}), 400
-
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
-        client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-        client.disconnect()
-        return jsonify({"ok": True, "sent_to": "sms" if force_sms else "telegram_app"}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/confirm", methods=["POST"])
-def tg_confirm():
-    """
-    Подтверждаем вход: body = { "code": "12345", "password": "опц. 2FA" }
-    В ответ отдаём сгенерированный StringSession — скопируй в ENV TELEGRAM_STRING_SESSION.
-    """
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not (API_ID and API_HASH and PHONE_NUMBER):
-        return jsonify({"error": "TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_PHONE not set"}), 400
-
-    data = request.json or {}
-    code = (data.get("code") or "").strip()
-    password = data.get("password")  # 2FA
-    if not code:
-        return jsonify({"error": "code is required"}), 400
-
-    client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
-    try:
-        client.connect()
-        if client.is_user_authorized():
-            s = StringSession.save(client.session)
-            me = client.get_me()
-            client.disconnect()
-            return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-
-        try:
-            client.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            if not password:
-                client.disconnect()
-                return jsonify({"ok": False, "error": "2FA enabled: password required"}), 400
-            client.sign_in(password=password)
-
-        s = StringSession.save(client.session)
-        me = client.get_me()
-        client.disconnect()
-        return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-    except Exception as e:
-        try:
-            client.disconnect()
-        except:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/logout", methods=["POST"])
-def tg_logout():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        client.log_out()
-        client.disconnect()
-        try:
-            p = os.path.join("data", "tg_session.session")
-            if os.path.exists(p):
-                os.remove(p)
-        except:
-            pass
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ========= Serve SPA (frontend_dist) =========
 @app.route("/", defaults={"path": ""})
