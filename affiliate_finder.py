@@ -23,6 +23,13 @@ if TELEGRAM_ENABLED:
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 
+# Gemini (LLM) — бесплатный gemini-1.5-flash
+GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "true").lower() == "true"
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")  # не хардкодим ключ
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "8.0"))  # сек
+
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
@@ -37,7 +44,7 @@ app = Flask(
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    "https://search-assistance-production.up.railway.app",  # проверь, без опечаток
+    "https://search-assistance-production.up.railway.app",
 }
 CORS(
     app,
@@ -239,8 +246,111 @@ def analyze_result(description, prompt_phrases):
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
-# ========= Query generation =========
-def generate_search_queries(prompt, region="wt-wt"):
+# ========= LLM: расширение запросов через Gemini =========
+def expand_queries_with_gemini(user_prompt: str, region: str):
+    """
+    Возвращает (expanded_queries, phrases, telegram_queries).
+    Если выключен/нет ключа/ошибка — возвращает None, тогда используем fallback.
+    """
+    if not GEMINI_ENABLED or not GEMINI_API_KEY:
+        return None
+
+    sys_hint = (
+        "You are a query generator for web search. "
+        "Given a vague user request (possibly in Russian), produce 3-5 concise, high-intent search queries. "
+        "Always add English keywords even if the input is Russian. "
+        "Prefer phrases suitable for Google/DuckDuckGo. "
+        "Return only a JSON array of strings. No extra text."
+    )
+
+    user_text = (
+        f"Region: {region}\n"
+        f"User request: {user_prompt}\n\n"
+        "Generate diverse queries that target official pages, partner programs, affiliate portals, "
+        "and social/contact links (site:, inurl:affiliate, 'partner program', 'affiliate', 'CPA', 'apply')."
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": sys_hint},
+                    {"text": user_text}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 256
+        }
+    }
+
+    try:
+        r = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=GEMINI_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Извлекаем текст из candidates
+        text = ""
+        for cand in (data.get("candidates") or []):
+            parts = (((cand.get("content") or {}).get("parts")) or [])
+            for p in parts:
+                t = p.get("text")
+                if t:
+                    text += t + "\n"
+
+        if not text:
+            return None
+
+        # Ожидаем JSON-массив строк. Если прилетела не-JSON — пробуем простым парсером.
+        queries = None
+        try:
+            queries = json.loads(text)
+            if not isinstance(queries, list):
+                queries = None
+        except Exception:
+            # fallback: берем строки по дефисам/новым строкам/кавычкам
+            lines = [ln.strip("-• \t") for ln in text.splitlines() if ln.strip()]
+            # Оставим 3-5 осмысленных
+            queries = lines[:5]
+
+        # Нормализуем и удалим дубли
+        cleaned = []
+        seen = set()
+        for q in queries or []:
+            if isinstance(q, str):
+                qq = q.strip()
+                if qq and qq.lower() not in seen:
+                    cleaned.append(qq)
+                    seen.add(qq.lower())
+
+        if not cleaned:
+            return None
+
+        # Параллельно сделаем фразы (ключевики) для ранжирования
+        phrases = []
+        for q in cleaned:
+            # Берем несколько слов >3 символов
+            tokens = [w for w in q.replace("|", " ").split() if len(w) > 3]
+            phrases.extend(tokens[:4])
+        phrases = list(dict.fromkeys(phrases))[:12]
+
+        # Для телеги обычно достаточно исходного и 1-2 уточнения
+        telegram_qs = [user_prompt] + cleaned[:2]
+        telegram_qs = list(dict.fromkeys([q for q in telegram_qs if q]))[:3]
+
+        return cleaned, phrases, telegram_qs
+    except Exception as e:
+        logger.warning(f"Gemini expand failed: {e}")
+        return None
+
+# ========= Query generation (fallback) =========
+def generate_search_queries_fallback(prompt, region="wt-wt"):
     valid = ["wt-wt","ua-ua","ru-ru","us-en","de-de","fr-fr","uk-en"]
     prompt = (prompt or "").strip()
     if region not in valid:
@@ -526,18 +636,30 @@ def search():
 
     try:
         data = request.json or {}
-        query = data.get("query", "")
+        user_query = data.get("query", "") or ""
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
         max_results = int(data.get("max_results", 15))
 
-        if not query:
+        if not user_query.strip():
             return jsonify({"error": "Query is required"}), 400
 
-        logger.info(f"API request: query='{query}', region={region}, telegram={use_telegram}, engine={engine}")
+        logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
 
-        # Reset DB for each request
+        # --- Расширяем запрос Gemini (если доступен), иначе fallback
+        gem = expand_queries_with_gemini(user_query, region)
+        if gem:
+            web_queries, prompt_phrases, telegram_queries = gem
+        else:
+            web_queries, prompt_phrases, region, telegram_queries = generate_search_queries_fallback(user_query, region)
+
+        # Подстрахуем: включим оригинальный запрос в пул
+        if user_query not in web_queries:
+            web_queries = [user_query] + web_queries
+        web_queries = list(dict.fromkeys([q for q in web_queries if q]))[:8]  # не больше 8 запросов в сумме
+
+        # Reset DB для каждого запроса
         with sqlite3.connect("search_results.db") as conn:
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS results")
@@ -558,7 +680,6 @@ def search():
             conn.commit()
 
         # Build & collect URLs
-        web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(query, region)
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
@@ -584,7 +705,8 @@ def search():
             "results": all_results,
             "telegram_enabled": use_telegram,
             "region": region,
-            "engine": engine
+            "engine": engine,
+            "expanded_queries": web_queries[:8]  # полезно на фронте для дебага (можно скрыть)
         })
     except Exception as e:
         logger.error(f"API error: {e}")
