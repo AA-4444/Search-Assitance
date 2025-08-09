@@ -9,11 +9,46 @@ import logging
 import sqlite3
 import requests
 from datetime import datetime
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+
+# Регулярка для удаления ```json и аналогичных блоков кода
+CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+def clean_text(text: str) -> str:
+    """
+    Очищает текст от обрамляющих блоков кода, кавычек, апострофов, 
+    лишних пробелов и управляющих символов.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    # Убираем блоки вида ```json ... ```
+    t = CODE_FENCE_RE.sub("", t)
+
+    # Срезаем кавычки, апострофы, обратные апострофы, пробелы по краям
+    t = t.strip(" \n\t\r\"'`")
+
+    # Если встречаются лишние фигурные или квадратные скобки по краям
+    while t and (t[0] in "[{" and t[-1] in "]}"):
+        t = t[1:-1].strip()
+
+    return t
+
+def clean_description(description):
+    """
+    Очищает описание: убирает HTML-теги и сокращает до 200 слов.
+    """
+    if not description:
+        return "N/A"
+    soup = BeautifulSoup(str(description), "html.parser")
+    text = soup.get_text().strip()
+    return " ".join(text.split()[:200])
+
 
 # ===== Optional HF pipeline (classifier). If not installed, continue without it.
 try:
@@ -29,7 +64,7 @@ if TELEGRAM_ENABLED:
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # <= установи в Railway
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # <= укажи в Railway
 
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,8 +72,8 @@ FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
 
 app = Flask(
     __name__,
-    static_folder=FRONTEND_DIST,
-    static_url_path="/"
+    static_folder=FRONTEND_DIST,   # отдаём фронт из собранной папки
+    static_url_path="/"            # чтобы /assets/... открывались корректно
 )
 
 # ========= CORS =========
@@ -99,100 +134,6 @@ PROXY_CACHE_FILE = "proxies.json"
 PROXY_API_URL = "https://www.proxy-list.download/api/v1/get?type=https&anon=elite"
 MAX_PROXY_ATTEMPTS = int(os.getenv("MAX_PROXY_ATTEMPTS", "2"))
 
-# ========= Text cleaning & relevance filters =========
-CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
-
-BAD_DOMAINS = {
-    "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
-    "youtube.com","reddit.com","getlasso.co","wiktionary.org","rezka.ag",
-    "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
-    "xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
-    "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
-}
-
-SPORTS_TRASH_TOKENS = {
-    "футбол","теннис","биатлон","хокей","баскетбол","волейбол","снукер",
-    "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
-}
-
-# ——— Контекстные правила: что считать «про партнёрки»
-AFFILIATE_INCLUDE = {
-    # RU
-    "партнер","партнёр","партнерка","партнёрка","партнерки","партнёрки",
-    "аффилиат","аффилиейт","реферальн","реферал","партнерская программа","партнёрская программа",
-    "revshare","cpa","hybrid","спа", "каб","оффер","офферы",
-    "партнерская сеть","партнёрская сеть","партнерская программа казино","партнёрская программа казино",
-    # EN
-    "affiliate","affiliates","affiliate program","partner program",
-    "referral","rev share","rev-share","cpa affiliate","offerwall","publisher program"
-}
-AFFILIATE_EXCLUDE_GENERIC = {
-    # типичные страницы «топ казино / играть / бонусы» — не про партнёрки
-    "best online casinos","top casinos","casino bonus","welcome bonus","play now","real money",
-    "best slots","free spins","no deposit","casino reviews","играть в казино","лучшие казино",
-    "топ казино","бонусы казино","обзор казино","игровые автоматы","слоты","слоты онлайн",
-    "пополнить счет","онлайн казино 2025","лучшие онлайн казино","casino rating","casino rankings"
-}
-
-def clean_text(text: str) -> str:
-    """
-    Очищает текст от ```json/``` и кавычек, и убирает лишние крайние скобки.
-    """
-    if not text:
-        return ""
-    t = text.strip()
-    t = CODE_FENCE_RE.sub("", t)
-    t = t.strip(" \n\t\r\"'`")
-    while t and (t[0] in "[{" and t[-1] in "]}"):
-        t = t[1:-1].strip()
-    return t
-
-def clean_description(description):
-    """
-    Убираем HTML, сокращаем до ~200 слов.
-    """
-    if not description:
-        return "N/A"
-    soup = BeautifulSoup(str(description), "html.parser")
-    text = soup.get_text(" ").strip()
-    return " ".join(text.split()[:200])
-
-def domain_of(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url).netloc or "").lower()
-    except Exception:
-        return ""
-
-def looks_like_sports_garbage(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(tok in t for tok in SPORTS_TRASH_TOKENS)
-
-def is_relevant_url(url, prompt_phrases):
-    u = (url or "").lower()
-    if any(bad in u for bad in BAD_DOMAINS):
-        return False
-    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
-    return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
-
-def rank_result(description, prompt_phrases):
-    score = 0.0
-    d = (description or "").lower()
-    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
-    for w in words:
-        if w in d:
-            score += 0.3 if len(w) > 6 else 0.2
-    for p in prompt_phrases:
-        if p.lower() in d:
-            score += 0.4
-    if "t.me" in d or "instagram.com" in d:
-        score += 0.2
-    if looks_like_sports_garbage(d):
-        score = min(score, 0.2)
-    return min(score, 1.0)
-
 # ========= Classifier (optional) =========
 def init_classifier():
     if pipeline is None:
@@ -216,87 +157,6 @@ def init_classifier():
             return None
 
 classifier = init_classifier()
-
-def analyze_result(description, prompt_phrases):
-    specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
-    cleaned = clean_description(description).lower()
-    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
-    if classifier is None:
-        status = "Active" if any(w in cleaned for w in words) else "Unknown"
-        return True, specialization, status, f"Подходит: Связан с {specialization}"
-    labels = [p.title() for p in prompt_phrases[:3]] + ["Social Media", "Other"] or ["Relevant", "Other"]
-    try:
-        result = classifier(cleaned, candidate_labels=labels, multi_label=False)
-        is_rel = (result["labels"][0] != "Other") or any(w in cleaned for w in words) or any(p.lower() in cleaned for p in prompt_phrases)
-        status = "Active" if any(w in cleaned for w in words) else "Unknown"
-        suitability = f"Подходит: Соответствует {specialization}" if is_rel else f"Частично подходит: Связан с {specialization}"
-        return is_rel, specialization, status, suitability
-    except Exception as e:
-        logger.warning(f"Classifier analysis failed: {e}, saving anyway")
-        status = "Active" if any(w in cleaned for w in words) else "Unknown"
-        return True, specialization, status, f"Подходит: Связан с {specialization}"
-
-# ========= Intent detection & context filters =========
-def build_context_filters(user_query: str) -> Dict[str, Any]:
-    """
-    Формируем правила include/exclude в зависимости от намерения.
-    Сейчас поддерживаем "affiliate intent" (поиск партнёров/ПП).
-    """
-    q = (user_query or "").lower()
-
-    affiliate_intent = any(s in q for s in (
-        "партнер", "партнёр", "партнерк", "партнёрк", "партнерская", "партнёрская",
-        "affiliate", "affiliat", "referral", "revshare", "cpa", "partner program",
-        "партнеров", "партнёров", "партнёрство", "партнерство",
-        "партнеры", "партнёры", "пп", "оффер"
-    ))
-
-    include_terms = set()
-    exclude_terms = set()
-
-    if affiliate_intent:
-        include_terms |= AFFILIATE_INCLUDE
-        exclude_terms |= AFFILIATE_EXCLUDE_GENERIC
-
-    return {
-        "affiliate_intent": affiliate_intent,
-        "include_terms": {t.lower() for t in include_terms},
-        "exclude_terms": {t.lower() for t in exclude_terms}
-    }
-
-def looks_irrelevant_to_intent(name: str, description: str, url: str, ctx: Dict[str, Any]) -> bool:
-    """
-    true => отбросить результат.
-    Логика:
-      1) если запрос про партнёрки, но текст похож на "рейтинг казино/играть/бонусы", выкидываем.
-      2) если нет ни одного include-терма, а exclude встречается — выкидываем.
-    """
-    full = f"{name or ''} {description or ''} {url or ''}".lower()
-
-    # спорт-мусор сразу вон
-    if looks_like_sports_garbage(full):
-        return True
-
-    inc = ctx["include_terms"]
-    exc = ctx["exclude_terms"]
-    if not inc and not exc:
-        return False  # нет специальных правил — не режем
-
-    has_include = any(t in full for t in inc) if inc else True
-    has_exclude = any(t in full for t in exc) if exc else False
-
-    # Жёсткое правило для affiliate intent:
-    if ctx["affiliate_intent"]:
-        # если явно казино-рейтинги/бонусы и нет сигналов партнёрки — выкидываем
-        if has_exclude and not has_include:
-            return True
-
-        # дополнительные эвристики по URL/Title
-        if any(key in full for key in ["best online casinos", "top casinos", "лучшие казино", "топ казино", "casino rating", "casino rankings"]):
-            if not any(k in full for k in ["affiliate", "партнер", "партн", "revshare", "cpa", "partner program", "рефераль"]):
-                return True
-
-    return False
 
 # ========= DB =========
 def init_db():
@@ -379,24 +239,107 @@ def get_proxy():
         proxies = fetch_free_proxies()
     return random.choice(proxies) if proxies else None
 
-# ========= Query generation with Gemini + fallback =========
-_GEMINI_CALLS = 0
+# ========= Text cleaning & relevance filters =========
+CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
+BAD_DOMAINS = {
+    "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
+    "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
+    "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
+    "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
+    "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
+}
+
+SPORTS_TRASH_TOKENS = {
+    "футбол","теннис","биатлон","хокей","баскетбол","волейбол","снукер",
+    "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
+}
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    t = CODE_FENCE_RE.sub("", t)             # убираем ```json ... ```
+    t = t.strip(" \n\t\r\"'`")               # срезаем обрамляющие кавычки/апострофы
+    return t
+
+def domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+def looks_like_sports_garbage(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(tok in t for tok in SPORTS_TRASH_TOKENS)
+
+def clean_description(description):
+    if not description:
+        return "N/A"
+    soup = BeautifulSoup(str(description), "html.parser")
+    text = soup.get_text().strip()
+    return " ".join(text.split()[:200])
+
+def is_relevant_url(url, prompt_phrases):
+    u = (url or "").lower()
+    if any(bad in u for bad in BAD_DOMAINS):
+        return False
+    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
+    return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
+
+def rank_result(description, prompt_phrases):
+    score = 0.0
+    d = (description or "").lower()
+    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
+    for w in words:
+        if w in d:
+            score += 0.3 if len(w) > 6 else 0.2
+    for p in prompt_phrases:
+        if p.lower() in d:
+            score += 0.4
+    if "t.me" in d or "instagram.com" in d:
+        score += 0.2
+    if looks_like_sports_garbage(d):
+        score = min(score, 0.2)
+    return min(score, 1.0)
+
+def analyze_result(description, prompt_phrases):
+    specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
+    cleaned = clean_description(description).lower()
+    words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
+    if classifier is None:
+        status = "Active" if any(w in cleaned for w in words) else "Unknown"
+        return True, specialization, status, f"Подходит: Связан с {specialization}"
+    labels = [p.title() for p in prompt_phrases[:3]] + ["Social Media", "Other"] or ["Relevant", "Other"]
+    try:
+        result = classifier(cleaned, candidate_labels=labels, multi_label=False)
+        is_rel = (result["labels"][0] != "Other") or any(w in cleaned for w in words) or any(p.lower() in cleaned for p in prompt_phrases)
+        status = "Active" if any(w in cleaned for w in words) else "Unknown"
+        suitability = f"Подходит: Соответствует {specialization}" if is_rel else f"Частично подходит: Связан с {specialization}"
+        return is_rel, specialization, status, suitability
+    except Exception as e:
+        logger.warning(f"Classifier analysis failed: {e}, saving anyway")
+        status = "Active" if any(w in cleaned for w in words) else "Unknown"
+        return True, specialization, status, f"Подходит: Связан с {specialization}"
+
+# ========= Query generation with Gemini + fallback =========
 def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], List[str]]:
-    global _GEMINI_CALLS
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
     system_instruction = (
         "Ты помощник для поиска сайтов. Преобразуй запрос пользователя в массив из 4–6 коротких поисковых запросов. "
-        "Добавь ключевые слова на английском, даже если исходный текст на русском. Не пиши комментарии. "
+        "Добавь синонимы на английском, даже если исходный текст на русском. Не пиши комментарии. "
         "Верни ТОЛЬКО JSON-массив строк."
     )
     body = {
         "contents": [{
             "parts": [
                 {"text": system_instruction},
-                {"text": f"Запрос: {user_prompt}\nРегион: {region}\nФормат: JSON массив строк."}
+                {"text": f"Запрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
             ]
         }],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 256}
@@ -425,8 +368,7 @@ def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], Lis
             arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
             arr = [x for x in arr if x and len(x) <= 200]
             if arr:
-                _GEMINI_CALLS += 1
-                logger.info("Использован Gemini (query expansion). Gemini calls in session: %d", _GEMINI_CALLS)
+                logger.info("Using Gemini for query expansion")
                 return arr[:6], arr[:6]
     except Exception:
         pass
@@ -449,10 +391,10 @@ def fallback_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], L
 
     queries = [base] + en_boost
     queries = list(dict.fromkeys([q for q in queries if q]))
-    logger.info("Использован fallback для расширения запросов")
+    logger.info("Using fallback for query expansion")
     return queries[:6], queries[:6]
 
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str, Any]]:
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str]]:
     valid = ["wt-wt","ua-ua","ru-ru","us-en","de-de","fr-fr","uk-en"]
     if region not in valid:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
@@ -460,7 +402,7 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
 
     user_prompt = (user_prompt or "").strip()
     if not user_prompt:
-        return [user_prompt], [], region, [user_prompt], build_context_filters(user_prompt)
+        return [user_prompt], [], region, [user_prompt]
 
     try:
         queries, phrases = gemini_expand_queries(user_prompt, region)
@@ -469,8 +411,7 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         queries, phrases = fallback_expand_queries(user_prompt, region)
 
     telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
-    ctx = build_context_filters(user_prompt)
-    return queries, phrases, region, telegram_queries, ctx
+    return queries, phrases, region, telegram_queries
 
 # ========= Search engines (DDG / SerpAPI) =========
 def duckduckgo_search(query, max_results=15, region="wt-wt"):
@@ -585,7 +526,7 @@ def telegram_search(queries, prompt_phrases):
     return results
 
 # ========= Scraper =========
-def search_and_scrape_websites(urls, prompt_phrases, ctx: Dict[str, Any]):
+def search_and_scrape_websites(urls, prompt_phrases):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
     urls = list(dict.fromkeys(urls))[:50]
@@ -634,9 +575,8 @@ def search_and_scrape_websites(urls, prompt_phrases, ctx: Dict[str, Any]):
                 if el:
                     country = clean_description(el.text)
 
-                # Контекстная фильтрация здесь — отсекаем нерелевант
-                if looks_irrelevant_to_intent(name, description, url, ctx):
-                    logger.info(f"Context-filtered out: {url}")
+                if looks_like_sports_garbage(description):
+                    logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
 
@@ -784,10 +724,9 @@ def search():
             )
             conn.commit()
 
-        # Context from query
-        web_queries, prompt_phrases, region, telegram_queries, ctx = generate_search_queries(user_query, region)
-
         # Build & collect URLs
+        web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(user_query, region)
+
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
@@ -798,22 +737,21 @@ def search():
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
-        # Scrape with context filter
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, ctx)
+        # Scrape
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases)
 
         # Telegram (optional)
         telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
         all_results = web_results + telegram_results
 
-        # Hard cleanup pass (ещё раз контекст)
+        # Hard cleanup pass
         filtered = []
         for r in all_results:
-            name = r.get("name","")
-            desc = r.get("description","")
-            url  = r.get("website","")
-            if domain_of(url) in BAD_DOMAINS:
+            txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
+            dom = domain_of(r.get("website",""))
+            if dom in BAD_DOMAINS:
                 continue
-            if looks_irrelevant_to_intent(name, desc, url, ctx):
+            if looks_like_sports_garbage(txt):
                 continue
             filtered.append(r)
 
@@ -823,9 +761,6 @@ def search():
         # Exports
         save_to_csv()
         save_to_txt()
-
-        # Лёгкая заметка в лог: сколько раз дергали Gemini
-        logger.info("Session summary: Gemini calls = %d", _GEMINI_CALLS)
 
         return jsonify({
             "results": all_results,
