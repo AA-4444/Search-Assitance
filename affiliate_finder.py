@@ -9,48 +9,42 @@ import logging
 import sqlite3
 import requests
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
-# Регулярка для удаления ```json и аналогичных блоков кода
+# ======================= Helpers: text cleaning =======================
 CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 def clean_text(text: str) -> str:
-    """
-    Очищает текст от обрамляющих блоков кода, кавычек, апострофов, 
-    лишних пробелов и управляющих символов.
-    """
+    """Убираем ```json...```, крайние кавычки/апострофы и лишние крайние скобки."""
     if not text:
         return ""
     t = text.strip()
-
-    # Убираем блоки вида ```json ... ```
     t = CODE_FENCE_RE.sub("", t)
-
-    # Срезаем кавычки, апострофы, обратные апострофы, пробелы по краям
     t = t.strip(" \n\t\r\"'`")
-
-    # Если встречаются лишние фигурные или квадратные скобки по краям
     while t and (t[0] in "[{" and t[-1] in "]}"):
         t = t[1:-1].strip()
-
     return t
 
 def clean_description(description):
-    """
-    Очищает описание: убирает HTML-теги и сокращает до 200 слов.
-    """
+    """Убираем HTML и сокращаем до ~200 слов."""
     if not description:
         return "N/A"
     soup = BeautifulSoup(str(description), "html.parser")
-    text = soup.get_text().strip()
+    text = soup.get_text(" ").strip()
     return " ".join(text.split()[:200])
 
+def domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
 
-# ===== Optional HF pipeline (classifier). If not installed, continue without it.
+# ======================= Optional HF classifier =======================
 try:
     from transformers import pipeline
 except Exception:
@@ -64,7 +58,7 @@ if TELEGRAM_ENABLED:
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # <= укажи в Railway
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # укажи в Railway
 
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -72,8 +66,8 @@ FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
 
 app = Flask(
     __name__,
-    static_folder=FRONTEND_DIST,   # отдаём фронт из собранной папки
-    static_url_path="/"            # чтобы /assets/... открывались корректно
+    static_folder=FRONTEND_DIST,
+    static_url_path="/"
 )
 
 # ========= CORS =========
@@ -120,36 +114,61 @@ REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 from ddgs import DDGS
 
 REGION_MAP = {
+    # Global / базовые
     "wt-wt": {"hl": "en", "gl": "us"},
-    "ua-ua": {"hl": "uk", "gl": "ua"},
+    "us-en": {"hl": "en", "gl": "us"},
+    "uk-en": {"hl": "en", "gl": "gb"},
+    "de-de": {"hl": "de", "gl": "de"},
+    "fr-fr": {"hl": "fr", "gl": "fr"},
     "ru-ru": {"hl": "ru", "gl": "ru"},
+    "ua-ua": {"hl": "uk", "gl": "ua"},
+
+    # СНГ
+    "kz-ru": {"hl": "ru", "gl": "kz"},
     "kz-kk": {"hl": "kk", "gl": "kz"},
-    "by-be": {"hl": "be", "gl": "by"},
+    "by-ru": {"hl": "ru", "gl": "by"},
+    "uz-ru": {"hl": "ru", "gl": "uz"},
+    "az-ru": {"hl": "ru", "gl": "az"},
+    "kg-ru": {"hl": "ru", "gl": "kg"},
+    "am-ru": {"hl": "ru", "gl": "am"},
+    "ge-ka": {"hl": "ka", "gl": "ge"},
+
+    # Европа
     "pl-pl": {"hl": "pl", "gl": "pl"},
     "es-es": {"hl": "es", "gl": "es"},
     "it-it": {"hl": "it", "gl": "it"},
     "nl-nl": {"hl": "nl", "gl": "nl"},
-    "ch-de": {"hl": "de", "gl": "ch"},
     "se-sv": {"hl": "sv", "gl": "se"},
-    "cn-zh": {"hl": "zh", "gl": "cn"},
-    "jp-ja": {"hl": "ja", "gl": "jp"},
+    "no-no": {"hl": "no", "gl": "no"},
+    "fi-fi": {"hl": "fi", "gl": "fi"},
+    "cz-cs": {"hl": "cs", "gl": "cz"},
+    "sk-sk": {"hl": "sk", "gl": "sk"},
+    "ro-ro": {"hl": "ro", "gl": "ro"},
+    "hu-hu": {"hl": "hu", "gl": "hu"},
+    "ch-de": {"hl": "de", "gl": "ch"},
+
+    # Азия / Ближний Восток
+    "tr-tr": {"hl": "tr", "gl": "tr"},
+    "ae-en": {"hl": "en", "gl": "ae"},
+    "sa-ar": {"hl": "ar", "gl": "sa"},
+    "il-he": {"hl": "he", "gl": "il"},
     "in-en": {"hl": "en", "gl": "in"},
+    "id-id": {"hl": "id", "gl": "id"},
+    "ph-en": {"hl": "en", "gl": "ph"},
     "sg-en": {"hl": "en", "gl": "sg"},
+    "my-ms": {"hl": "ms", "gl": "my"},
     "th-th": {"hl": "th", "gl": "th"},
     "vn-vi": {"hl": "vi", "gl": "vn"},
-    "my-ms": {"hl": "ms", "gl": "my"},
+    "jp-ja": {"hl": "ja", "gl": "jp"},
     "kr-ko": {"hl": "ko", "gl": "kr"},
-    "ae-ar": {"hl": "ar", "gl": "ae"},
-    "sa-ar": {"hl": "ar", "gl": "sa"},
+    "cn-zh": {"hl": "zh", "gl": "cn"},
+
+    # Америка/Океания
     "ca-en": {"hl": "en", "gl": "ca"},
     "br-pt": {"hl": "pt", "gl": "br"},
     "mx-es": {"hl": "es", "gl": "mx"},
     "au-en": {"hl": "en", "gl": "au"},
     "nz-en": {"hl": "en", "gl": "nz"},
-    "us-en": {"hl": "en", "gl": "us"},
-    "de-de": {"hl": "de", "gl": "de"},
-    "fr-fr": {"hl": "fr", "gl": "fr"},
-    "uk-en": {"hl": "en", "gl": "gb"},
 }
 
 # ========= Proxy config =========
@@ -164,7 +183,7 @@ def init_classifier():
         return None
     model_main = os.getenv("CLASSIFIER_MODEL", "facebook/bart-large-mnli")
     model_fallback = os.getenv("CLASSIFIER_FALLBACK", "distilbert-base-uncased")
-    device = int(os.getenv("CLASSIFIER_DEVICE", "-1"))  # -1 = CPU
+    device = int(os.getenv("CLASSIFIER_DEVICE", "-1"))
     try:
         clf = pipeline("zero-shot-classification", model=model_main, device=device)
         logger.info(f"Classifier initialized: {model_main} (device={device})")
@@ -262,9 +281,7 @@ def get_proxy():
         proxies = fetch_free_proxies()
     return random.choice(proxies) if proxies else None
 
-# ========= Text cleaning & relevance filters =========
-CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
-
+# ========= Trash filters =========
 BAD_DOMAINS = {
     "zhihu.com","baidu.com","commentcamarche.net","google.com","d4drivers.uk","dvla.gov.uk",
     "youtube.com","reddit.com","affpapa.com","getlasso.co","wiktionary.org","rezka.ag",
@@ -278,34 +295,13 @@ SPORTS_TRASH_TOKENS = {
     "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
 }
 
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    t = text.strip()
-    t = CODE_FENCE_RE.sub("", t)             # убираем ```json ... ```
-    t = t.strip(" \n\t\r\"'`")               # срезаем обрамляющие кавычки/апострофы
-    return t
-
-def domain_of(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url).netloc or "").lower()
-    except Exception:
-        return ""
-
 def looks_like_sports_garbage(text: str) -> bool:
     if not text:
         return False
     t = text.lower()
     return any(tok in t for tok in SPORTS_TRASH_TOKENS)
 
-def clean_description(description):
-    if not description:
-        return "N/A"
-    soup = BeautifulSoup(str(description), "html.parser")
-    text = soup.get_text().strip()
-    return " ".join(text.split()[:200])
-
+# ========= Intent-agnostic analysis =========
 def is_relevant_url(url, prompt_phrases):
     u = (url or "").lower()
     if any(bad in u for bad in BAD_DOMAINS):
@@ -313,7 +309,72 @@ def is_relevant_url(url, prompt_phrases):
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
 
-def rank_result(description, prompt_phrases):
+# --- GEO hints for biasing
+GEO_HINTS: Dict[str, Dict[str, Any]] = {
+    "kz-ru": {"tld": "kz", "tokens": ["Казахстан", "KZ", "Алматы", "Астана", "Astana", "Almaty"]},
+    "kz-kk": {"tld": "kz", "tokens": ["Қазақстан", "KZ", "Алматы", "Астана"]},
+    "by-ru": {"tld": "by", "tokens": ["Беларусь", "BY", "Минск"]},
+    "ua-ua": {"tld": "ua", "tokens": ["Україна", "Украина", "UA", "Київ", "Киев", "Львів", "Одеса"]},
+    "ru-ru": {"tld": "ru", "tokens": ["Россия", "RF", "Москва", "Санкт-Петербург"]},
+    "pl-pl": {"tld": "pl", "tokens": ["Polska", "Poland", "Warszawa"]},
+    "de-de": {"tld": "de", "tokens": ["Deutschland", "Berlin", "München"]},
+    "fr-fr": {"tld": "fr", "tokens": ["France", "Paris"]},
+    "tr-tr": {"tld": "tr", "tokens": ["Türkiye", "Istanbul", "Ankara"]},
+    "ae-en": {"tld": "ae", "tokens": ["UAE", "Dubai", "Abu Dhabi"]},
+    "in-en": {"tld": "in", "tokens": ["India", "Delhi", "Mumbai"]},
+    "sg-en": {"tld": "sg", "tokens": ["Singapore", "SG"]},
+    "jp-ja": {"tld": "jp", "tokens": ["日本", "東京", "Tokyo"]},
+    "kr-ko": {"tld": "kr", "tokens": ["대한민국", "서울", "Seoul"]},
+    "es-es": {"tld": "es", "tokens": ["España", "Madrid", "Barcelona"]},
+    "it-it": {"tld": "it", "tokens": ["Italia", "Roma", "Milano"]},
+    "nl-nl": {"tld": "nl", "tokens": ["Nederland", "Amsterdam"]},
+    "se-sv": {"tld": "se", "tokens": ["Sverige", "Stockholm"]},
+    "no-no": {"tld": "no", "tokens": ["Norge", "Oslo"]},
+    "fi-fi": {"tld": "fi", "tokens": ["Suomi", "Helsinki"]},
+    "cz-cs": {"tld": "cz", "tokens": ["Česko", "Praha"]},
+    "sk-sk": {"tld": "sk", "tokens": ["Slovensko", "Bratislava"]},
+    "ro-ro": {"tld": "ro", "tokens": ["România", "București"]},
+    "hu-hu": {"tld": "hu", "tokens": ["Magyarország", "Budapest"]},
+    "ch-de": {"tld": "ch", "tokens": ["Schweiz", "Zürich"]},
+    "us-en": {"tld": "us", "tokens": ["USA", "United States"]},
+    "uk-en": {"tld": "uk", "tokens": ["United Kingdom", "London"]},
+    "br-pt": {"tld": "br", "tokens": ["Brasil", "São Paulo"]},
+    "mx-es": {"tld": "mx", "tokens": ["México", "CDMX"]},
+    "au-en": {"tld": "au", "tokens": ["Australia", "Sydney", "Melbourne"]},
+    "nz-en": {"tld": "nz", "tokens": ["New Zealand", "Auckland"]},
+}
+
+def apply_geo_bias(queries: List[str], region: str) -> List[str]:
+    """Добавляем к первым подзапросам страновой контекст и site:.tld."""
+    hint = GEO_HINTS.get(region)
+    if not hint:
+        return queries
+    tld = hint["tld"]
+    tokens = hint["tokens"]
+    biased = []
+    for i, q in enumerate(queries):
+        if i == 0:
+            biased.append(f"{q} {' '.join(tokens[:2])}".strip())
+        elif i == 1:
+            biased.append(f"{q} site:.{tld}")
+        else:
+            biased.append(q)
+    return biased
+
+def geo_score_boost(url: str, text: str, region: str) -> float:
+    hint = GEO_HINTS.get(region)
+    if not hint:
+        return 0.0
+    boost = 0.0
+    dom = domain_of(url)
+    if dom.endswith(f".{hint['tld']}"):
+        boost += 0.35
+    t = (text or "").lower()
+    if any(tok.lower() in t for tok in hint["tokens"]):
+        boost += 0.15
+    return min(boost, 0.5)
+
+def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None) -> float:
     score = 0.0
     d = (description or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
@@ -327,6 +388,8 @@ def rank_result(description, prompt_phrases):
         score += 0.2
     if looks_like_sports_garbage(d):
         score = min(score, 0.2)
+    if url and region:
+        score += geo_score_boost(url, d, region)
     return min(score, 1.0)
 
 def analyze_result(description, prompt_phrases):
@@ -355,7 +418,7 @@ def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], Lis
 
     system_instruction = (
         "Ты помощник для поиска сайтов. Преобразуй запрос пользователя в массив из 4–6 коротких поисковых запросов. "
-        "Добавь синонимы на английском, даже если исходный текст на русском. Не пиши комментарии. "
+        "Добавь синонимы на английском даже если исходный текст на русском. Не пиши комментарии. "
         "Верни ТОЛЬКО JSON-массив строк."
     )
     body = {
@@ -391,6 +454,7 @@ def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], Lis
             arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
             arr = [x for x in arr if x and len(x) <= 200]
             if arr:
+                arr = apply_geo_bias(arr[:6], region)
                 logger.info("Using Gemini for query expansion")
                 return arr[:6], arr[:6]
     except Exception:
@@ -414,12 +478,12 @@ def fallback_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], L
 
     queries = [base] + en_boost
     queries = list(dict.fromkeys([q for q in queries if q]))
+    queries = apply_geo_bias(queries[:6], region)
     logger.info("Using fallback for query expansion")
     return queries[:6], queries[:6]
 
 def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str]]:
-    valid = ["wt-wt","ua-ua","ru-ru","us-en","de-de","fr-fr","uk-en"]
-    if region not in valid:
+    if region not in REGION_MAP:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
 
@@ -524,7 +588,7 @@ def telegram_search(queries, prompt_phrases):
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
                         description = clean_description(getattr(chat, "description", "N/A"))
                         is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
-                        score = rank_result(description, prompt_phrases)
+                        score = rank_result(description, prompt_phrases, url=username)
                         if is_relevant_url(username, prompt_phrases) or score > 0.1:
                             row = {
                                 "id": str(uuid.uuid4()),
@@ -536,6 +600,7 @@ def telegram_search(queries, prompt_phrases):
                                 "score": score,
                             }
                             results.append(row)
+                            # Сохраняем в БД с базовыми полями
                             save_to_db(row, is_rel, spec, status, suit, score)
                         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
             except FloodWaitError as e:
@@ -549,7 +614,7 @@ def telegram_search(queries, prompt_phrases):
     return results
 
 # ========= Scraper =========
-def search_and_scrape_websites(urls, prompt_phrases):
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
     urls = list(dict.fromkeys(urls))[:50]
@@ -604,7 +669,7 @@ def search_and_scrape_websites(urls, prompt_phrases):
                     break
 
                 is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
-                score = rank_result(description, prompt_phrases)
+                score = rank_result(description, prompt_phrases, url=url, region=region)
                 if is_relevant_url(url, prompt_phrases) or score > 0.1:
                     row = {
                         "id": str(uuid.uuid4()),
@@ -699,7 +764,16 @@ def save_to_txt():
     except Exception as e:
         logger.error(f"Error saving to TXT: {e}")
 
-# ========= API (основной маршрут /search) =========
+def prefer_country_results(rows: List[dict], region: str) -> List[dict]:
+    hint = GEO_HINTS.get(region)
+    if not hint:
+        return rows
+    tld = f".{hint['tld']}"
+    a = [r for r in rows if domain_of(r.get("website","")).endswith(tld)]
+    b = [r for r in rows if not domain_of(r.get("website","")).endswith(tld)]
+    return a + b
+
+# ========= API =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     if request.method == "OPTIONS":
@@ -761,7 +835,7 @@ def search():
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
         # Scrape
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases)
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region)
 
         # Telegram (optional)
         telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
@@ -778,7 +852,8 @@ def search():
                 continue
             filtered.append(r)
 
-        all_results = filtered
+        # Гео-приоритизация и сортировка
+        all_results = prefer_country_results(filtered, region)
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
         # Exports
