@@ -19,6 +19,7 @@ from flask_cors import CORS
 CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 def clean_text(text: str) -> str:
+    """Убираем ```json...```, крайние кавычки/апострофы и лишние крайние скобки."""
     if not text:
         return ""
     t = text.strip()
@@ -29,6 +30,7 @@ def clean_text(text: str) -> str:
     return t
 
 def clean_description(description):
+    """Убираем HTML и сокращаем до ~200 слов."""
     if not description:
         return "N/A"
     soup = BeautifulSoup(str(description), "html.parser")
@@ -56,7 +58,7 @@ if TELEGRAM_ENABLED:
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # укажи в Railway
 
 # ========= Flask app + static frontend =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -288,6 +290,13 @@ BAD_DOMAINS = {
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
 }
 
+# домены справочников/обучалок, которые мешают, когда мы ищем компании/каталоги
+KNOWLEDGE_DOMAINS = {
+    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org",
+    "hubspot.com","coursera.org","ibm.com","sproutsocial.com",
+    "digitalmarketinginstitute.com","marketermilk.com","harvard.edu","professional.dce.harvard.edu"
+}
+
 SPORTS_TRASH_TOKENS = {
     "футбол","теннис","биатлон","хокей","баскетбол","волейбол","снукер",
     "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
@@ -298,6 +307,26 @@ def looks_like_sports_garbage(text: str) -> bool:
         return False
     t = text.lower()
     return any(tok in t for tok in SPORTS_TRASH_TOKENS)
+
+# ========= Intent detection =========
+INTENT_AFFILIATE = {
+    "affiliate","аффилиат","аффилиэйт","партнерка","партнёрка","партнерская программа","партнёрская программа",
+    "реферальная","referral","cpa","игемблинг","игейминг","igaming","casino affiliate","affiliate network",
+    "партнеры казино","партнёры казино"
+}
+INTENT_LEARN = {
+    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to"
+}
+
+def detect_intent(q: str) -> Dict[str, bool]:
+    t = (q or "").lower()
+    affiliate = any(k in t for k in INTENT_AFFILIATE)
+    learn = any(k in t for k in INTENT_LEARN)
+    return {
+        "affiliate": affiliate,
+        "learn": learn,
+        "business": not learn  # по умолчанию считаем, что ищем компании/каталоги
+    }
 
 # ========= Intent-agnostic analysis =========
 def is_relevant_url(url, prompt_phrases):
@@ -343,6 +372,7 @@ GEO_HINTS: Dict[str, Dict[str, Any]] = {
 }
 
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
+    """Добавляем к первым подзапросам страновой контекст и site:.tld."""
     hint = GEO_HINTS.get(region)
     if not hint:
         return queries
@@ -409,23 +439,26 @@ def analyze_result(description, prompt_phrases):
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
 # ========= Query generation with Gemini + fallback =========
-def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], List[str]]:
+def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]) -> Tuple[List[str], List[str]]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
+    # Строго просим не добавлять affiliate-термины, если намерение не affiliate
     system_instruction = (
-        "Ты помощник для поиска сайтов. Преобразуй запрос пользователя в массив из 4–6 коротких поисковых запросов. "
-        "Добавь синонимы на английском даже если исходный текст на русском. Не пиши комментарии. "
+        "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 4–6 коротких запросов по теме. "
+        "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
+        "Если запрос про аффилиатки — добавь релевантные англоязычные термины. Не пиши комментарии. "
         "Верни ТОЛЬКО JSON-массив строк."
     )
+    guard = "AFFILIATE=YES" if intent.get("affiliate") else "AFFILIATE=NO"
     body = {
         "contents": [{
             "parts": [
                 {"text": system_instruction},
-                {"text": f"Запрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
+                {"text": f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
             ]
         }],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 256}
+        "generationConfig": {"temperature": 0.35, "maxOutputTokens": 256}
     }
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     params = {"key": GEMINI_API_KEY}
@@ -459,55 +492,90 @@ def gemini_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], Lis
 
     raise RuntimeError("Gemini returned invalid JSON")
 
-def fallback_expand_queries(user_prompt: str, region: str) -> Tuple[List[str], List[str]]:
+def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]) -> Tuple[List[str], List[str]]:
     base = user_prompt.strip()
-    en_boost = [
-        "affiliate programs",
-        "partner program application",
-        "affiliate marketing",
-        "referral program",
-        "CPA affiliate",
-        "best affiliate networks",
-    ]
-    lower = base.lower()
-    if any(k in lower for k in ["казино", "гемблинг", "gambling", "casino", "беттинг", "ставки"]):
-        en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
+    queries: List[str] = [base]
 
-    queries = [base] + en_boost
+    if intent.get("affiliate"):
+        en_boost = [
+            "affiliate programs",
+            "partner program application",
+            "affiliate marketing",
+            "referral program",
+            "CPA affiliate",
+            "best affiliate networks",
+        ]
+        # iGaming кейс
+        lower = base.lower()
+        if any(k in lower for k in ["казино","гемблинг","gambling","casino","беттинг","ставки","igaming"]):
+            en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
+        queries += en_boost
+    else:
+        # Обычный бизнес/каталоги без маркетингового мусора
+        # добавим варианты на RU/UK + EN generic
+        generic = [
+            f"{base} официальный сайт",
+            f"{base} каталог",
+            f"{base} список",
+            f"{base} компании",
+            f"{base} directory",
+            f"{base} companies",
+            f"{base} official site"
+        ]
+        queries += generic
+
+    # remove dups, apply geo bias
     queries = list(dict.fromkeys([q for q in queries if q]))
     queries = apply_geo_bias(queries[:6], region)
-    logger.info("Using fallback for query expansion")
+    logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')})")
     return queries[:6], queries[:6]
 
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str]]:
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
     if region not in REGION_MAP:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
 
     user_prompt = (user_prompt or "").strip()
     if not user_prompt:
-        return [user_prompt], [], region, [user_prompt]
+        return [user_prompt], [], region, [user_prompt], {"affiliate": False, "learn": False, "business": True}
+
+    intent = detect_intent(user_prompt)
 
     try:
-        queries, phrases = gemini_expand_queries(user_prompt, region)
+        queries, phrases = gemini_expand_queries(user_prompt, region, intent)
     except Exception as e:
         logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
-        queries, phrases = fallback_expand_queries(user_prompt, region)
+        queries, phrases = fallback_expand_queries(user_prompt, region, intent)
 
     telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
-    return queries, phrases, region, telegram_queries
+    return queries, phrases, region, telegram_queries, intent
+
+# ========= Build query with negative site filters by intent =========
+NEGATIVE_SITES_FOR_BUSINESS = [
+    "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
+    "site:hubspot.com","site:coursera.org","site:ibm.com","site:sproutsocial.com",
+    "site:digitalmarketinginstitute.com","site:marketermilk.com","site:harvard.edu","site:professional.dce.harvard.edu"
+]
+
+def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
+    if intent.get("business") and not intent.get("learn"):
+        # при поиске компаний стараемся отминусовать обучалки/вики
+        negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS)
+        return f"{q} {negatives}".strip()
+    return q
 
 # ========= Search engines (DDG / SerpAPI) =========
-def duckduckgo_search(query, max_results=15, region="wt-wt"):
+def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
         return []
-    logger.info(f"DDG search: '{query}' region={region}")
+    q = with_intent_filters(query, intent or {"business": True})
+    logger.info(f"DDG search: '{q}' region={region}")
     urls = []
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(query, region=region, safesearch="moderate", timelimit="y", max_results=max_results)
+            results = ddgs.text(q, region=region, safesearch="moderate", timelimit="y", max_results=max_results)
             for r in results:
                 href = r.get("href")
                 if href:
@@ -517,16 +585,17 @@ def duckduckgo_search(query, max_results=15, region="wt-wt"):
         urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
-        logger.error(f"DDG failed for '{query}': {e}")
+        logger.error(f"DDG failed for '{q}': {e}")
         return []
 
-def serpapi_search(query, max_results=15, region="wt-wt"):
+def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
     if not SERPAPI_API_KEY:
         logger.info("SERPAPI_API_KEY is not set; skipping SerpAPI")
         return []
-    params = {"engine": "google", "q": query, "num": max_results, "api_key": SERPAPI_API_KEY}
+    q = with_intent_filters(query, intent or {"business": True})
+    params = {"engine": "google", "q": q, "num": max_results, "api_key": SERPAPI_API_KEY}
     params.update(REGION_MAP.get(region, REGION_MAP["wt-wt"]))
-    logger.info(f"SerpAPI search: '{query}' region={region}")
+    logger.info(f"SerpAPI search: '{q}' region={region}")
     try:
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=20)
         r.raise_for_status()
@@ -539,7 +608,7 @@ def serpapi_search(query, max_results=15, region="wt-wt"):
         urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
-        logger.error(f"SerpAPI failed for '{query}': {e}")
+        logger.error(f"SerpAPI failed for '{q}': {e}")
         return []
 
 # ========= Telegram =========
@@ -561,32 +630,26 @@ def telegram_search(queries, prompt_phrases):
         client.connect()
         if not client.is_user_authorized():
             try:
-                # 1) если заранее положили TELEGRAM_LOGIN_CODE — используем
+                client.send_code_request(PHONE_NUMBER)
                 code = os.getenv("TELEGRAM_LOGIN_CODE")
-                if code:
-                    client.sign_in(PHONE_NUMBER, code)
-                else:
-                    # 2) иначе инициируем отправку кода (для удобства)
-                    client.send_code_request(PHONE_NUMBER)
-                    logger.warning("Telegram requires login. Call /api/telegram/complete_login with the code.")
-                    client.disconnect()
+                if not code:
+                    logger.error("TELEGRAM_LOGIN_CODE not provided")
                     return results
+                client.sign_in(PHONE_NUMBER, code)
             except SessionPasswordNeededError:
                 if not TELEGRAM_2FA_PASSWORD:
                     logger.error("2FA enabled but TELEGRAM_2FA_PASSWORD not set")
-                    client.disconnect()
                     return results
                 client.sign_in(password=TELEGRAM_2FA_PASSWORD)
             except Exception as e:
                 logger.error(f"Telegram auth failed: {e}")
-                client.disconnect()
                 return results
-
         for q in queries:
             logger.info(f"Searching Telegram for: {q}")
             try:
                 result = client(SearchRequest(q=q, limit=10))
                 for chat in result.chats:
+                    # берём публичные каналы/суперчаты (без мегагрупп, чтобы выдавать паблики/каналы)
                     if hasattr(chat, "megagroup") and not chat.megagroup:
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
@@ -617,7 +680,20 @@ def telegram_search(queries, prompt_phrases):
     return results
 
 # ========= Scraper =========
-def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str):
+def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> bool:
+    """Отсекаем обучалки/вики, если пользователь ищет компании/партнёров."""
+    if not intent.get("business") or intent.get("learn"):
+        return False
+    t = (text or "").lower()
+    u = (url or "").lower()
+    if any(k in t for k in ["что такое", "what is", "определение", "definition", "гайд", "guide", "курс", "обзор", "overview"]):
+        return True
+    dom = domain_of(u)
+    if dom in KNOWLEDGE_DOMAINS:
+        return True
+    return False
+
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool]):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
     urls = list(dict.fromkeys(urls))[:50]
@@ -666,8 +742,15 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                 if el:
                     country = clean_description(el.text)
 
+                # Отсекаем спорт-мусор
                 if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
+                    success = True
+                    break
+
+                # Отсекаем обучалки/вики, если ищем компании
+                if looks_like_definition_page(description, url, intent):
+                    logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
 
@@ -776,61 +859,6 @@ def prefer_country_results(rows: List[dict], region: str) -> List[dict]:
     b = [r for r in rows if not domain_of(r.get("website","")).endswith(tld)]
     return a + b
 
-# ========= API: Telegram bootstrap (первый логин) =========
-@app.route("/api/telegram/send_code", methods=["POST"])
-def telegram_send_code():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"ok": False, "msg": "TELEGRAM_ENABLED=false"}), 400
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
-    if not (API_ID and API_HASH and PHONE_NUMBER):
-        return jsonify({"ok": False, "msg": "Missing TELEGRAM_* envs"}), 400
-    try:
-        client = TelegramClient("session_name", API_ID, API_HASH)
-        client.connect()
-        if client.is_user_authorized():
-            client.disconnect()
-            return jsonify({"ok": True, "msg": "Already authorized"})
-        client.send_code_request(PHONE_NUMBER)
-        client.disconnect()
-        return jsonify({"ok": True, "msg": "Code sent to Telegram"})
-    except Exception as e:
-        logger.error(f"/telegram/send_code error: {e}")
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-@app.route("/api/telegram/complete_login", methods=["POST"])
-def telegram_complete_login():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"ok": False, "msg": "TELEGRAM_ENABLED=false"}), 400
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
-    data = request.json or {}
-    code = (data.get("code") or "").strip()
-    password = data.get("password")
-    if not (API_ID and API_HASH and PHONE_NUMBER and code):
-        return jsonify({"ok": False, "msg": "Missing API_ID/API_HASH/PHONE or code"}), 400
-    try:
-        client = TelegramClient("session_name", API_ID, API_HASH)
-        client.connect()
-        if client.is_user_authorized():
-            client.disconnect()
-            return jsonify({"ok": True, "msg": "Already authorized"})
-        try:
-            client.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            pwd = password or os.getenv("TELEGRAM_2FA_PASSWORD")
-            if not pwd:
-                client.disconnect()
-                return jsonify({"ok": False, "msg": "2FA enabled. Provide 'password'"}), 401
-            client.sign_in(password=pwd)
-        client.disconnect()
-        return jsonify({"ok": True, "msg": "Telegram authorized"})
-    except Exception as e:
-        logger.error(f"/telegram/complete_login error: {e}")
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
 # ========= API =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
@@ -851,7 +879,7 @@ def search():
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
         max_results = int(data.get("max_results", 15))
 
         if not user_query:
@@ -879,33 +907,27 @@ def search():
             )
             conn.commit()
 
-        # Build queries
-        web_queries, prompt_phrases, region, telegram_queries = generate_search_queries(user_query, region)
+        # Build & collect URLs
+        web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
 
-        # === Telegram warmup/search (раньше, чтобы авторизация произошла сразу)
-        telegram_results = []
-        if use_telegram:
-            logger.info("Telegram warmup/search starting early...")
-            telegram_results = telegram_search(telegram_queries, prompt_phrases)
-
-        # Collect URLs from engines
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
-                all_urls.extend(duckduckgo_search(q, max_results=max_results, region=region))
+                all_urls.extend(duckduckgo_search(q, max_results=max_results, region=region, intent=intent))
             if engine in ("serpapi", "both"):
-                all_urls.extend(serpapi_search(q, max_results=max_results, region=region))
+                all_urls.extend(serpapi_search(q, max_results=max_results, region=region, intent=intent))
 
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
         # Scrape
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region)
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent)
 
-        # Combine results
-        all_results = web_results + (telegram_results if use_telegram else [])
+        # Telegram (optional)
+        telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
+        all_results = web_results + telegram_results
 
-        # Hard cleanup
+        # Hard cleanup pass
         filtered = []
         for r in all_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
@@ -913,6 +935,9 @@ def search():
             if dom in BAD_DOMAINS:
                 continue
             if looks_like_sports_garbage(txt):
+                continue
+            if intent.get("business") and not intent.get("learn") and dom in KNOWLEDGE_DOMAINS:
+                # выкидываем вики/обучалки на финальном шаге тоже
                 continue
             filtered.append(r)
 
@@ -968,11 +993,6 @@ def serve_frontend(path):
         return send_from_directory(FRONTEND_DIST, "index.html")
     return "frontend_dist is missing. Please upload your built frontend.", 404
 
-# ========= Health =========
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True}), 200
-
 # ========= Entry =========
 if __name__ == "__main__":
     init_db()
@@ -981,4 +1001,3 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     logger.info(f"Starting Flask on http://{host}:{port} (debug={debug})")
     app.run(host=host, port=port, debug=debug, use_reloader=False)
-
