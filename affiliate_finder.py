@@ -54,7 +54,6 @@ except Exception:
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 if TELEGRAM_ENABLED:
     from telethon.sync import TelegramClient
-    from telethon.sessions import StringSession
     from telethon.tl.functions.contacts import SearchRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
@@ -310,42 +309,21 @@ def looks_like_sports_garbage(text: str) -> bool:
     return any(tok in t for tok in SPORTS_TRASH_TOKENS)
 
 # ========= Intent detection =========
-AFFILIATE_VARIANTS = {
-    "affiliate","affiliat","affilate","referral","cpa","revshare","partner program","affiliate program",
-    "affiliate network","networks",
-    "аффилиат","аффилиейт","аффилейт","афилейт","афелейт",
-    "партнерка","партнёрка","партнерские программы","партнёрские программы",
-    "партнерская программа","партнёрская программа","реферальная","реферал","рефералы"
+INTENT_AFFILIATE = {
+    "affiliate","аффилиат","аффилиэйт","партнерка","партнёрка","партнерская программа","партнёрская программа",
+    "реферальная","referral","cpa","игемблинг","игейминг","igaming","casino affiliate","affiliate network",
+    "партнеры казино","партнёры казино"
 }
-CASINO_VARIANTS = {"казино","casino","igaming","игейминг","гемблинг","беттинг","ставки","bookmaker","букмекер"}
-
-COMPANY_HINTS = {
-    "company","companies","agency","agencies","platform","software","solution","solutions",
-    "service","services","provider","providers","network","program","programs","system",
-    "компания","компании","агентство","агентства","платформа","софт","решение","решения",
-    "услуга","услуги","провайдер","поставщик","платформы","система","системы"
-}
-
-LEARN_HINTS = {
-    "что такое","what is","определение","definition","гайд","guide","обзор","overview",
-    "курс","course","как работает","how to","советы","tips","статья","article","блог","blog","новости","news"
+INTENT_LEARN = {
+    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to"
 }
 
 def detect_intent(q: str) -> Dict[str, bool]:
     t = (q or "").lower()
-
-    score = 0.0
-    if any(v in t for v in AFFILIATE_VARIANTS): score += 1.0
-    if any(v in t for v in CASINO_VARIANTS):    score += 0.5
-    if any(v in t for v in COMPANY_HINTS):      score += 0.5
-
-    affiliate = score >= 1.0 and any(v in t for v in AFFILIATE_VARIANTS)
-    company_search = affiliate and any(v in t for v in COMPANY_HINTS)
-    learn = any(k in t for k in LEARN_HINTS)
-
+    affiliate = any(k in t for k in INTENT_AFFILIATE)
+    learn = any(k in t for k in INTENT_LEARN)
     return {
         "affiliate": affiliate,
-        "company_search": company_search,
         "learn": learn,
         "business": not learn  # по умолчанию считаем, что ищем компании/каталоги
     }
@@ -465,6 +443,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
+    # Строго просим не добавлять affiliate-термины, если намерение не affiliate
     system_instruction = (
         "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 4–6 коротких запросов по теме. "
         "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
@@ -518,40 +497,22 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
     queries: List[str] = [base]
 
     if intent.get("affiliate"):
-        # Если ищем именно компании в affiliate-контексте — усиливаем company-маркерами
-        if intent.get("company_search"):
-            positives = [
-                "affiliate marketing agency casino",
-                "iGaming affiliate agency",
-                "casino affiliate platform",
-                "affiliate tracking software casino",
-                "affiliate program management casino",
-                "affiliate network casino",
-                "services provider iGaming affiliate"
-            ]
-            ru_pos = [
-                "агентство аффилиат маркетинга казино",
-                "компании affiliate для казино",
-                "платформа партнерских программ казино",
-                "софт для affiliate казино",
-                "управление партнерской программой казино",
-                "affiliate network казино"
-            ]
-            queries += positives + ru_pos
-        else:
-            en_boost = [
-                "affiliate programs",
-                "partner program application",
-                "affiliate marketing",
-                "referral program",
-                "CPA affiliate",
-                "best affiliate networks",
-            ]
-            lower = base.lower()
-            if any(k in lower for k in ["казино","гемблинг","gambling","casino","беттинг","ставки","igaming"]):
-                en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
-            queries += en_boost
+        en_boost = [
+            "affiliate programs",
+            "partner program application",
+            "affiliate marketing",
+            "referral program",
+            "CPA affiliate",
+            "best affiliate networks",
+        ]
+        # iGaming кейс
+        lower = base.lower()
+        if any(k in lower for k in ["казино","гемблинг","gambling","casino","беттинг","ставки","igaming"]):
+            en_boost += ["casino affiliate programs", "iGaming affiliate", "online casino affiliates"]
+        queries += en_boost
     else:
+        # Обычный бизнес/каталоги без маркетингового мусора
+        # добавим варианты на RU/UK + EN generic
         generic = [
             f"{base} официальный сайт",
             f"{base} каталог",
@@ -566,8 +527,28 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
     # remove dups, apply geo bias
     queries = list(dict.fromkeys([q for q in queries if q]))
     queries = apply_geo_bias(queries[:6], region)
-    logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, company={intent.get('company_search')})")
+    logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')})")
     return queries[:6], queries[:6]
+
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
+    if region not in REGION_MAP:
+        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
+        region = "wt-wt"
+
+    user_prompt = (user_prompt or "").strip()
+    if not user_prompt:
+        return [user_prompt], [], region, [user_prompt], {"affiliate": False, "learn": False, "business": True}
+
+    intent = detect_intent(user_prompt)
+
+    try:
+        queries, phrases = gemini_expand_queries(user_prompt, region, intent)
+    except Exception as e:
+        logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
+        queries, phrases = fallback_expand_queries(user_prompt, region, intent)
+
+    telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
+    return queries, phrases, region, telegram_queries, intent
 
 # ========= Build query with negative site filters by intent =========
 NEGATIVE_SITES_FOR_BUSINESS = [
@@ -576,20 +557,12 @@ NEGATIVE_SITES_FOR_BUSINESS = [
     "site:digitalmarketinginstitute.com","site:marketermilk.com","site:harvard.edu","site:professional.dce.harvard.edu"
 ]
 
-NEGATIVE_CONTENT_FOR_COMPANY = [
-    "-\"что такое\"","-обзор","-обзоры","-гайд","-guides","-guide","-blog","-блог","-новости","-news",
-    "-курс","-courses","-статья","-article","-wiki"
-]
-
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
-    # 1) режем обучалки/вики, если пользователь ищет бизнес
     if intent.get("business") and not intent.get("learn"):
+        # при поиске компаний стараемся отминусовать обучалки/вики
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS)
-        q = f"{q} {negatives}".strip()
-    # 2) если affiliate+company_search — срезаем контентные страницы
-    if intent.get("affiliate") and intent.get("company_search"):
-        q = f"{q} " + " ".join(NEGATIVE_CONTENT_FOR_COMPANY)
-    return q.strip()
+        return f"{q} {negatives}".strip()
+    return q
 
 # ========= Search engines (DDG / SerpAPI) =========
 def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
@@ -638,74 +611,45 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]
         logger.error(f"SerpAPI failed for '{q}': {e}")
         return []
 
-# ========= Telegram (client helper + endpoints + search) =========
-# ENV, которые нужны:
-# TELEGRAM_ENABLED=true
-# TELEGRAM_API_ID=...
-# TELEGRAM_API_HASH=...
-# TELEGRAM_PHONE=+XXXXXXXXXXX
-# TELEGRAM_STRING_SESSION= (после /telegram/confirm сохранить сюда)
-# TELEGRAM_FORCE_SMS=true|false (опционально)
-def get_tg_client():
-    """Создаёт/возвращает Telethon-клиент со строковой сессией (если задана) или сессией-файлом."""
-    if not TELEGRAM_ENABLED:
-        return None, "TELEGRAM_ENABLED is false"
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    if not (API_ID and API_HASH):
-        return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
-
-    string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
-    try:
-        if string_session:
-            client = TelegramClient(StringSession(string_session), API_ID, API_HASH)
-        else:
-            os.makedirs("data", exist_ok=True)
-            client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
-        client.connect()
-        return client, None
-    except Exception as e:
-        return None, f"Failed to init Telegram client: {e}"
-
+# ========= Telegram =========
 def telegram_search(queries, prompt_phrases):
     if not TELEGRAM_ENABLED:
         logger.info("Telegram search disabled")
         return []
-
     results = []
     API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
     API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
+    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE")
+    TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD")
 
     if not (API_ID and API_HASH and PHONE_NUMBER):
         logger.error("Telegram env not fully configured; skipping")
         return results
-
-    client, err = get_tg_client()
-    if err:
-        logger.error(err)
-        return results
-
     try:
+        client = TelegramClient("session_name", API_ID, API_HASH)
+        client.connect()
         if not client.is_user_authorized():
-            force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
             try:
-                client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-                logger.info("Telegram code sent. Complete login via /telegram/confirm")
-                client.disconnect()
-                return results
+                client.send_code_request(PHONE_NUMBER)
+                code = os.getenv("TELEGRAM_LOGIN_CODE")
+                if not code:
+                    logger.error("TELEGRAM_LOGIN_CODE not provided")
+                    return results
+                client.sign_in(PHONE_NUMBER, code)
+            except SessionPasswordNeededError:
+                if not TELEGRAM_2FA_PASSWORD:
+                    logger.error("2FA enabled but TELEGRAM_2FA_PASSWORD not set")
+                    return results
+                client.sign_in(password=TELEGRAM_2FA_PASSWORD)
             except Exception as e:
-                logger.error(f"Telegram code request failed: {e}")
-                client.disconnect()
+                logger.error(f"Telegram auth failed: {e}")
                 return results
-
         for q in queries:
             logger.info(f"Searching Telegram for: {q}")
             try:
                 result = client(SearchRequest(q=q, limit=10))
                 for chat in result.chats:
-                    # берём публичные каналы/суперчаты (без мегагрупп)
+                    # берём публичные каналы/суперчаты (без мегагрупп, чтобы выдавать паблики/каналы)
                     if hasattr(chat, "megagroup") and not chat.megagroup:
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
@@ -735,39 +679,7 @@ def telegram_search(queries, prompt_phrases):
         logger.error(f"Telegram client failed: {e}")
     return results
 
-# ========= Scraper: page-type heuristics =========
-ARTICLE_PATTERNS = [
-    "что такое","what is","определение","definition","гайд","guide","как","как работать",
-    "обзор","overview","новости","news","блог","blog","статья","article","academy","wiki"
-]
-COMPANY_POS_SIGNALS = [
-    "услуги","services","решения","solutions","о нас","about","контакты","contact",
-    "клиенты","clients","кейсы","cases","цены","pricing","демо","demo","заказать","request",
-    "портфолио","portfolio","команда","team","наш адрес","email","e-mail","+","тел","phone"
-]
-
-def looks_like_article_page(text: str, url: str) -> bool:
-    t = (text or "").lower()
-    u = (url or "").lower()
-    if any(p in u for p in ["/blog","/news","/wiki","/academy","/kb","/knowledge"]):
-        return True
-    return any(p in t for p in ARTICLE_PATTERNS)
-
-def looks_like_company_page(text: str, url: str, soup: BeautifulSoup) -> bool:
-    t = (text or "").lower()
-    if any(p in t for p in COMPANY_POS_SIGNALS):
-        return True
-    # header/footer навигация — если на странице есть явные пункты меню
-    nav = " ".join(el.get_text(" ").lower() for el in soup.select("nav, header, footer")[:3])
-    if any(p in nav for p in COMPANY_POS_SIGNALS):
-        return True
-    # наличие e-mail / телефона
-    if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", t):
-        return True
-    if re.search(r"\+\d[\d\s().-]{6,}", t):
-        return True
-    return False
-
+# ========= Scraper =========
 def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> bool:
     """Отсекаем обучалки/вики, если пользователь ищет компании/партнёров."""
     if not intent.get("business") or intent.get("learn"):
@@ -830,30 +742,17 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                 if el:
                     country = clean_description(el.text)
 
-                # 1) спорт-мусор
+                # Отсекаем спорт-мусор
                 if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
 
-                # 2) контентные страницы, если ищем компании для affiliate
-                if intent.get("affiliate") and intent.get("company_search") and looks_like_article_page(description, url):
-                    logger.info(f"Skip article/blog page by intent: {url}")
-                    success = True
-                    break
-
-                # 3) обучалки/вики, когда ищем бизнес
+                # Отсекаем обучалки/вики, если ищем компании
                 if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
-
-                # 4) если ищем компании — проверим, что страница похожа на компанию
-                if intent.get("affiliate") and intent.get("company_search"):
-                    if not looks_like_company_page(description, url, soup):
-                        logger.info(f"Skip non-company-looking page for affiliate-company intent: {url}")
-                        success = True
-                        break
 
                 is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
                 score = rank_result(description, prompt_phrases, url=url, region=region)
@@ -1038,6 +937,7 @@ def search():
             if looks_like_sports_garbage(txt):
                 continue
             if intent.get("business") and not intent.get("learn") and dom in KNOWLEDGE_DOMAINS:
+                # выкидываем вики/обучалки на финальном шаге тоже
                 continue
             filtered.append(r)
 
@@ -1080,117 +980,6 @@ def download_file(filetype):
 @app.route("/api/download/<filetype>", methods=["GET"])
 def api_download(filetype):
     return download_file(filetype)
-
-# ========= Telegram endpoints =========
-@app.route("/telegram/status", methods=["GET"])
-def tg_status():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"enabled": False, "authorized": False, "reason": "TELEGRAM_ENABLED is false"}), 200
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"enabled": True, "authorized": False, "error": err}), 200
-    try:
-        ok = client.is_user_authorized()
-        me = None
-        if ok:
-            me = client.get_me()
-            me = {"id": me.id, "username": getattr(me, "username", None), "phone": getattr(me, "phone", None)}
-        client.disconnect()
-        return jsonify({"enabled": True, "authorized": ok, "me": me}), 200
-    except Exception as e:
-        return jsonify({"enabled": True, "authorized": False, "error": str(e)}), 200
-
-@app.route("/telegram/send_code", methods=["POST"])
-def tg_send_code():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not PHONE_NUMBER:
-        return jsonify({"error": "TELEGRAM_PHONE not set"}), 400
-
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
-        client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-        client.disconnect()
-        return jsonify({"ok": True, "sent_to": "sms" if force_sms else "telegram_app"}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/confirm", methods=["POST"])
-def tg_confirm():
-    """
-    Подтверждаем вход: body = { "code": "12345", "password": "опц. 2FA" }
-    В ответ отдаём сгенерированный StringSession — скопируй в ENV TELEGRAM_STRING_SESSION.
-    """
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not (API_ID and API_HASH and PHONE_NUMBER):
-        return jsonify({"error": "TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_PHONE not set"}), 400
-
-    data = request.json or {}
-    code = (data.get("code") or "").strip()
-    password = data.get("password")  # 2FA
-    if not code:
-        return jsonify({"error": "code is required"}), 400
-
-    # используем файловую сессию для первичного логина, затем сохраним StringSession
-    os.makedirs("data", exist_ok=True)
-    client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
-    try:
-        client.connect()
-        if client.is_user_authorized():
-            s = StringSession.save(client.session)
-            me = client.get_me()
-            client.disconnect()
-            return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-
-        try:
-            client.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            if not password:
-                client.disconnect()
-                return jsonify({"ok": False, "error": "2FA enabled: password required"}), 400
-            client.sign_in(password=password)
-
-        s = StringSession.save(client.session)
-        me = client.get_me()
-        client.disconnect()
-        return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-    except Exception as e:
-        try:
-            client.disconnect()
-        except:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/logout", methods=["POST"])
-def tg_logout():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        client.log_out()
-        client.disconnect()
-        try:
-            p = os.path.join("data", "tg_session.session")
-            if os.path.exists(p):
-                os.remove(p)
-        except:
-            pass
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ========= Serve SPA (frontend_dist) =========
 @app.route("/", defaults={"path": ""})
