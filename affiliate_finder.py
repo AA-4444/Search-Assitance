@@ -220,6 +220,19 @@ def init_db():
                     score REAL
                 )"""
             )
+            # Хранилище пользовательских корректировок/предпочтений
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS feedback (
+                    id TEXT PRIMARY KEY,
+                    qkey TEXT,            -- ключ профиля запросов (аггрегированная тема)
+                    ftype TEXT,           -- тип: require_kw, forbid_kw, prefer_domain, block_domain
+                    value TEXT,           -- слово/домен/паттерн
+                    created_at TEXT
+                )"""
+            )
+            # Индексы для ускорения
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_qkey ON feedback(qkey)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ftype ON feedback(ftype)")
             conn.commit()
         logger.info("Database initialized")
     except sqlite3.Error as e:
@@ -356,6 +369,98 @@ def maybe_add_ru_site_dupes(queries: List[str]) -> List[str]:
             out.append(x); seen.add(x)
     return out
 
+# ========= FEEDBACK MEMORY (учёт корректировок клиента) =========
+def build_query_key(user_query: str, intent: Dict[str, bool]) -> str:
+    """
+    Ключ профиля запросов: агрегируем по теме, чтобы переносить предпочтения на похожие запросы.
+    Пример: affiliate+casino -> 'topic:affiliate_casino', иначе 'topic:generic'.
+    """
+    t = []
+    if intent.get("affiliate"): t.append("affiliate")
+    if intent.get("casino"): t.append("casino")
+    if not t:
+        t.append("generic")
+    return "topic:" + "_".join(sorted(set(t)))
+
+def save_feedback_items(qkey: str, items: List[Tuple[str, str]]):
+    """
+    items: список (ftype, value)
+    """
+    if not items:
+        return
+    try:
+        with sqlite3.connect("search_results.db") as conn:
+            cursor = conn.cursor()
+            for ftype, value in items:
+                cursor.execute(
+                    "INSERT INTO feedback (id, qkey, ftype, value, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), qkey, ftype, value.strip(), datetime.utcnow().isoformat())
+                )
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to save feedback: {e}")
+
+def load_feedback(qkey: str) -> Dict[str, List[str]]:
+    out = {"require_kw": [], "forbid_kw": [], "prefer_domain": [], "block_domain": []}
+    try:
+        with sqlite3.connect("search_results.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT ftype, value FROM feedback WHERE qkey = ?", (qkey,))
+            for ftype, value in cursor.fetchall():
+                if ftype in out and value:
+                    out[ftype].append(value.lower())
+    except sqlite3.Error as e:
+        logger.error(f"Failed to read feedback: {e}")
+    # уникализуем
+    for k in out:
+        seen = set()
+        uniq = []
+        for v in out[k]:
+            if v not in seen:
+                uniq.append(v); seen.add(v)
+        out[k] = uniq
+    return out
+
+def apply_feedback_pre_filter(urls: List[str], fb: Dict[str, List[str]]) -> List[str]:
+    """Перед скрейпом: выкидываем запрещённые домены, продвигаем любимые домены вверх."""
+    if not urls:
+        return urls
+    blocked = set(fb.get("block_domain") or [])
+    preferred = set(fb.get("prefer_domain") or [])
+    def blocked_domain(u: str) -> bool:
+        dom = domain_of(u)
+        return any(dom.endswith(b) or dom == b for b in blocked)
+    def preferred_domain(u: str) -> bool:
+        dom = domain_of(u)
+        return any(dom.endswith(p) or dom == p for p in preferred)
+    keep = [u for u in urls if not blocked_domain(u)]
+    # простой re-rank: сначала предпочитаемые
+    keep.sort(key=lambda u: (0 if preferred_domain(u) else 1, u))
+    return keep
+
+def apply_feedback_rank_boost(score: float, text: str, url: str, fb: Dict[str, List[str]]) -> float:
+    """После скрейпа: буст/штраф по ключевым словам и доменам."""
+    t = (text or "").lower()
+    dom = domain_of(url)
+    req = fb.get("require_kw") or []
+    forbd = fb.get("forbid_kw") or []
+    pref = fb.get("prefer_domain") or []
+    block = fb.get("block_domain") or []
+
+    # домены
+    if any(dom.endswith(p) or dom == p for p in pref):
+        score += 0.25
+    if any(dom.endswith(b) or dom == b for b in block):
+        score -= 0.6
+
+    # ключевые слова
+    if req and not any(r in t for r in req):
+        score -= 0.25
+    if any(f in t for f in forbd):
+        score -= 0.35
+
+    return max(0.0, min(1.0, score))
+
 # ========= Intent-agnostic analysis =========
 def is_relevant_url(url, prompt_phrases):
     u = (url or "").lower()
@@ -390,7 +495,7 @@ GEO_HINTS: Dict[str, Dict[str, Any]] = {
     "sk-sk": {"tld": "sk", "tokens": ["Slovensko", "Bratislava"]},
     "ro-ro": {"tld": "ro", "tokens": ["România", "București"]},
     "hu-hu": {"tld": "hu", "tokens": ["Magyarország", "Budapest"]},
-    "ch-de": {"tld": "ch", "tokens": ["Schweiz", "Zürich"]},
+    "ch-de": {"tld": "ch", "tokens": ["Schweiz", "Зürich"]},
     "us-en": {"tld": "us", "tokens": ["USA", "United States"]},
     "uk-en": {"tld": "uk", "tokens": ["United Kingdom", "London"]},
     "br-pt": {"tld": "br", "tokens": ["Brasil", "São Paulo"]},
@@ -471,6 +576,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
+    # Не меняю твою логику — только усиливаю формат JSON и парсинг
     system_instruction = (
         "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 8–12 коротких запросов по теме. "
         "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
@@ -478,6 +584,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
         "Верни ТОЛЬКО JSON-массив строк."
     )
     guard = "AFFILIATE=YES" if intent.get("affiliate") else "AFFILIATE=NO"
+
     body = {
         "contents": [{
             "parts": [
@@ -485,38 +592,93 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
                 {"text": f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
             ]
         }],
-        "generationConfig": {"temperature": 0.35, "maxOutputTokens": 512}
+        "generationConfig": {
+            "temperature": 0.35,
+            "maxOutputTokens": 512,
+            "responseMimeType": "application/json"
+        }
     }
+
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     params = {"key": GEMINI_API_KEY}
 
-    r = requests.post(url, params=params, json=body, timeout=15)
+    r = requests.post(url, params=params, json=body, timeout=25)
     r.raise_for_status()
     data = r.json()
 
-    text = ""
+    # Собираем весь текст из всех кандидатов/частей
+    raw_chunks: List[str] = []
     try:
-        candidates = data.get("candidates", [])
-        if candidates and "content" in candidates[0]:
-            parts = candidates[0]["content"].get("parts", [])
-            if parts and "text" in parts[0]:
-                text = parts[0]["text"]
+        for cand in data.get("candidates", []) or []:
+            content = cand.get("content") or {}
+            for part in content.get("parts", []) or []:
+                txt = part.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    raw_chunks.append(txt)
     except Exception:
         pass
 
-    text = clean_text(text)
-    try:
-        arr = json.loads(text)
-        if isinstance(arr, list):
-            arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
-            arr = [x for x in arr if x and len(x) <= 200]
-            if arr:
-                logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
-                return arr[:12], arr[:12]
-    except Exception:
-        pass
+    text = clean_text("\n".join(raw_chunks).strip())
 
-    raise RuntimeError("Gemini returned invalid JSON")
+    # Вспомогательный извлекатель первого JSON-массива [...]
+    def extract_first_json_array(s: str) -> str:
+        start_idx = None
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(s):
+            if ch == '"' and not esc:
+                in_str = not in_str
+            if ch == '\\' and not esc:
+                esc = True
+                continue
+            esc = False
+            if in_str:
+                continue
+            if ch == '[':
+                if depth == 0 and start_idx is None:
+                    start_idx = i
+                depth += 1
+            elif ch == ']':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_idx is not None:
+                        return s[start_idx:i+1]
+        return ""
+
+    # 1) Пытаемся сразу распарсить весь текст
+    arr = None
+    if text:
+        try:
+            maybe = json.loads(text)
+            if isinstance(maybe, list):
+                arr = maybe
+        except Exception:
+            pass
+
+    # 2) Если не вышло — достаём первый массив [...]
+    if arr is None:
+        candidate = extract_first_json_array(text or "")
+        if candidate:
+            try:
+                maybe = json.loads(candidate)
+                if isinstance(maybe, list):
+                    arr = maybe
+            except Exception:
+                arr = None
+
+    if not arr:
+        raise RuntimeError("Gemini returned invalid JSON")
+
+    # Чистим и нормируем
+    arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
+    arr = [x for x in arr if x and len(x) <= 200]
+
+    if not arr:
+        raise RuntimeError("Gemini returned empty array")
+
+    logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
+    return arr[:12], arr[:12]
 
 def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]) -> Tuple[List[str], List[str]]:
     base = user_prompt.strip()
@@ -536,7 +698,6 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
             "affiliate agency",
             "affiliate management agency",
         ]
-        # iGaming кейс
         if intent.get("casino"):
             en_boost += [
                 "casino affiliate programs",
@@ -546,7 +707,6 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
                 "gambling affiliate networks",
                 "igaming growth agency",
             ]
-            # русские варианты
             ru_boost = [
                 "аффилейт агентство казино",
                 "маркетинговое агентство iGaming",
@@ -557,7 +717,6 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
             queries += ru_boost
         queries += en_boost
     else:
-        # Обычный бизнес/каталоги без маркетингового мусора
         generic = [
             f"{base} официальный сайт",
             f"{base} каталог",
@@ -571,26 +730,20 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
         ]
         queries += generic
 
-    # RU+EN дубли, если запрос кириллицей
     if cyr:
-        # простые EN переформулировки основного запроса
         queries += [
             "affiliate marketing companies for casino",
             "casino marketing affiliate agencies",
             "igaming affiliate marketing companies",
             "casino affiliate management services",
         ] if intent.get("affiliate") and intent.get("casino") else []
-
-        # дубли с локальными зонами
         queries = maybe_add_ru_site_dupes(queries)
 
-    # remove dups, apply geo bias лёгко (оставим как есть, т.к. выше уже добавили site:.tld)
     queries = list(dict.fromkeys([q for q in queries if q]))[:20]
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, casino={intent.get('casino')}), produced {len(queries)} queries")
     return queries, queries
 
 def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
-    # регион оставляем пользователю как есть, но под капотом для DDG сделаем ru-ru, если кириллица и регион не задан
     if region not in REGION_MAP:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
@@ -607,7 +760,6 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
         queries, phrases = fallback_expand_queries(user_prompt, region, intent)
 
-    # для Telegram возьмём исходник + 2 топ фразы
     telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
     return queries, phrases, region, telegram_queries, intent
 
@@ -619,12 +771,10 @@ NEGATIVE_SITES_FOR_BUSINESS = [
 ]
 
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
-    # жёстче режем обучалки/вики только если ищем компании в аффилиейт-казино контексте
     if intent.get("business") and (intent.get("affiliate") and intent.get("casino")):
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS)
         return f"{q} {negatives}".strip()
     elif intent.get("business") and not intent.get("learn"):
-        # базово отминусуем вики, но не агрессивно
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS[:3])
         return f"{q} {negatives}".strip()
     return q
@@ -737,7 +887,6 @@ def telegram_search(queries, prompt_phrases):
 
     try:
         if not client.is_user_authorized():
-            # два пути: авто по TELEGRAM_LOGIN_CODE ИЛИ обычный send_code_request → sign_in → 2FA
             try:
                 client.send_code_request(PHONE_NUMBER, force_sms=os.getenv("TELEGRAM_FORCE_SMS","false").lower()=="true")
                 if TELEGRAM_LOGIN_CODE:
@@ -766,7 +915,6 @@ def telegram_search(queries, prompt_phrases):
             try:
                 result = client(SearchRequest(q=q, limit=10))
                 for chat in result.chats:
-                    # берём публичные каналы/суперчаты (без мегагрупп, чтобы выдавать паблики/каналы)
                     if hasattr(chat, "megagroup") and not chat.megagroup:
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
@@ -811,15 +959,14 @@ def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> b
     return False
 
 def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
-    # Жёсткий срез блогов/гайдов только если affiliate+casino+business
     if intent.get("business") and intent.get("affiliate") and intent.get("casino"):
         return looks_like_blog(url, text)
     return False
 
-def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool]):
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], fb: Dict[str, List[str]]):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
-    urls = list(dict.fromkeys(urls))[:80]  # повысим потолок
+    urls = apply_feedback_pre_filter(list(dict.fromkeys(urls))[:120], fb)  # до 120, с предфильтром
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
         if domain_of(url) in BAD_DOMAINS:
@@ -865,26 +1012,26 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                 if el:
                     country = clean_description(el.text)
 
-                # Отсекаем спорт-мусор
                 if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
 
-                # Вики/определения — если бизнес-кейс
                 if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
 
-                # Жёсткий срез блогов — только в affiliate+casino+business
                 if should_cut_blog(url, description, intent):
                     logger.info(f"Skip blog/guide page in affiliate+casino case: {url}")
                     success = True
                     break
 
                 is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
-                score = rank_result(description, prompt_phrases, url=url, region=region)
+                base_score = rank_result(description, prompt_phrases, url=url, region=region)
+                # применяем персональные корректировки
+                score = apply_feedback_rank_boost(base_score, f"{name} {description}", url, fb)
+
                 if is_relevant_url(url, prompt_phrases) or score > 0.1:
                     row = {
                         "id": str(uuid.uuid4()),
@@ -1036,8 +1183,10 @@ def search():
             )
             conn.commit()
 
-        # Build & collect URLs
+        # Интент и ключ профиля
         web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
+        qkey = build_query_key(user_query, intent)
+        fb = load_feedback(qkey)
 
         # Если кириллица и регион дефолтный — под капотом для DDG используем ru-ru
         force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
@@ -1052,8 +1201,8 @@ def search():
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
-        # Scrape
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent)
+        # Scrape (с учётом предфильтра feedback внутри)
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, fb)
 
         # Telegram (optional)
         telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
@@ -1087,7 +1236,8 @@ def search():
             "results": all_results,
             "telegram_enabled": use_telegram,
             "region": region,
-            "engine": engine
+            "engine": engine,
+            "qkey": qkey  # отдаём фронту, чтобы удобно отправлять фидбек
         })
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -1114,6 +1264,75 @@ def download_file(filetype):
 @app.route("/api/download/<filetype>", methods=["GET"])
 def api_download(filetype):
     return download_file(filetype)
+
+# ========= FEEDBACK endpoints =========
+@app.route("/feedback/add", methods=["POST"])
+def feedback_add():
+    """
+    BODY:
+    {
+      "user_query": "строка запроса",   -- опц. если не передан, будет '' (только через qkey)
+      "qkey": "topic:affiliate_casino", -- опц.; если нет, рассчитаем по user_query
+      "prefer_domains": ["example.com","agency.ru"],
+      "block_domains": ["wikipedia.org","blogsite.com"],
+      "require_keywords": ["agency","контакты","clients"],
+      "forbid_keywords": ["how to","что такое","гайд"]
+    }
+    """
+    try:
+        data = request.json or {}
+        user_query = (data.get("user_query") or "").strip()
+        qkey = (data.get("qkey") or "").strip()
+        if not qkey:
+            intent = detect_intent(user_query)
+            qkey = build_query_key(user_query, intent)
+
+        prefer_domains = [d.strip().lower() for d in (data.get("prefer_domains") or []) if d and isinstance(d, str)]
+        block_domains = [d.strip().lower() for d in (data.get("block_domains") or []) if d and isinstance(d, str)]
+        require_keywords = [k.strip().lower() for k in (data.get("require_keywords") or []) if k and isinstance(k, str)]
+        forbid_keywords = [k.strip().lower() for k in (data.get("forbid_keywords") or []) if k and isinstance(k, str)]
+
+        items = []
+        items += [("prefer_domain", d) for d in prefer_domains]
+        items += [("block_domain", d) for d in block_domains]
+        items += [("require_kw", k) for k in require_keywords]
+        items += [("forbid_kw", k) for k in forbid_keywords]
+
+        save_feedback_items(qkey, items)
+        return jsonify({"ok": True, "qkey": qkey, "added": len(items)}), 200
+    except Exception as e:
+        logger.error(f"feedback_add error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/feedback/list", methods=["GET"])
+def feedback_list():
+    """
+    Query params: qkey=topic:affiliate_casino
+    """
+    qkey = request.args.get("qkey", "").strip()
+    if not qkey:
+        return jsonify({"ok": False, "error": "qkey is required"}), 400
+    fb = load_feedback(qkey)
+    return jsonify({"ok": True, "qkey": qkey, "feedback": fb}), 200
+
+@app.route("/feedback/clear", methods=["POST"])
+def feedback_clear():
+    """
+    BODY: { "qkey": "topic:affiliate_casino" }
+    """
+    try:
+        data = request.json or {}
+        qkey = (data.get("qkey") or "").strip()
+        if not qkey:
+            return jsonify({"ok": False, "error": "qkey is required"}), 400
+        with sqlite3.connect("search_results.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM feedback WHERE qkey = ?", (qkey,))
+            conn.commit()
+        return jsonify({"ok": True, "qkey": qkey}), 200
+    except Exception as e:
+        logger.error(f"feedback_clear error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ========= Telegram endpoints =========
 @app.route("/telegram/status", methods=["GET"])
