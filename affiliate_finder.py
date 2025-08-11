@@ -429,6 +429,12 @@ def geo_score_boost(url: str, text: str, region: str) -> float:
         boost += 0.15
     return min(boost, 0.5)
 
+# --- company-like url tokens for scoring
+COMPANY_URL_TOKENS = [
+    "agency","network","partners","program","programs","platform","services","solutions",
+    "management","consulting","company","about","contact","affiliates"
+]
+
 def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None) -> float:
     score = 0.0
     d = (description or "").lower()
@@ -441,6 +447,17 @@ def rank_result(description: str, prompt_phrases: List[str], url: str = None, re
             score += 0.4
     if "t.me" in d or "instagram.com" in d:
         score += 0.2
+
+    # бонус за company-like URL’ы
+    if url:
+        uu = url.lower()
+        if any(tok in uu for tok in COMPANY_URL_TOKENS):
+            score += 0.3  # слегка подталкиваем вверх компании/агентства
+
+    # понижаем блоги/новости
+    if url and looks_like_blog(url, d):
+        score = max(score - 0.4, 0.0)
+
     if looks_like_sports_garbage(d):
         score = min(score, 0.2)
     if url and region:
@@ -467,30 +484,53 @@ def analyze_result(description, prompt_phrases):
         return True, specialization, status, f"Подходит: Связан с {specialization}"
 
 # ========= Query generation with Gemini + fallback =========
+def _extract_json_array_maybe(text: str) -> List[str]:
+    """Страховка: вытащить первый JSON-массив из произвольной строки."""
+    if not text:
+        return []
+    try:
+        val = json.loads(text)
+        if isinstance(val, list):
+            return val
+    except Exception:
+        pass
+    m = re.search(r"$begin:math:display$.*$end:math:display$", text, flags=re.DOTALL)
+    if not m:
+        return []
+    try:
+        val = json.loads(m.group(0))
+        if isinstance(val, list):
+            return val
+    except Exception:
+        return []
+    return []
+
 def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]) -> Tuple[List[str], List[str]]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
     system_instruction = (
-        "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 8–12 коротких запросов по теме. "
+        "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 8–12 коротких поисковых запросов по теме. "
         "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
-        "Если запрос про аффилиатки — добавь релевантные англоязычные термины. Не пиши комментарии. "
-        "Верни ТОЛЬКО JSON-массив строк."
+        "Если запрос про аффилиатки — добавь релевантные англоязычные термины (agency, network, program, platform, services). "
+        "НЕ пиши комментарии, не добавляй текст вне JSON. Верни ТОЛЬКО JSON-массив строк."
     )
     guard = "AFFILIATE=YES" if intent.get("affiliate") else "AFFILIATE=NO"
+    user_text = f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."
+
     body = {
-        "contents": [{
-            "parts": [
-                {"text": system_instruction},
-                {"text": f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.35, "maxOutputTokens": 512}
+        "system_instruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"parts": [{"text": user_text}]}],
+        "generationConfig": {
+            "temperature": 0.35,
+            "maxOutputTokens": 512,
+            "responseMimeType": "application/json"
+        }
     }
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     params = {"key": GEMINI_API_KEY}
 
-    r = requests.post(url, params=params, json=body, timeout=15)
+    r = requests.post(url, params=params, json=body, timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -499,22 +539,18 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
         candidates = data.get("candidates", [])
         if candidates and "content" in candidates[0]:
             parts = candidates[0]["content"].get("parts", [])
-            if parts and "text" in parts[0]:
-                text = parts[0]["text"]
+            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
     except Exception:
         pass
 
     text = clean_text(text)
-    try:
-        arr = json.loads(text)
-        if isinstance(arr, list):
-            arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
-            arr = [x for x in arr if x and len(x) <= 200]
-            if arr:
-                logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
-                return arr[:12], arr[:12]
-    except Exception:
-        pass
+    arr = _extract_json_array_maybe(text)
+    if isinstance(arr, list) and arr:
+        arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
+        arr = [x for x in arr if x and len(x) <= 200]
+        if arr:
+            logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
+            return arr[:12], arr[:12]
 
     raise RuntimeError("Gemini returned invalid JSON")
 
@@ -536,7 +572,6 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
             "affiliate agency",
             "affiliate management agency",
         ]
-        # iGaming кейс
         if intent.get("casino"):
             en_boost += [
                 "casino affiliate programs",
@@ -545,19 +580,22 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
                 "online casino affiliates",
                 "gambling affiliate networks",
                 "igaming growth agency",
+                "casino affiliate management company",
+                "igaming affiliate network",
+                "casino affiliate platform services",
             ]
-            # русские варианты
             ru_boost = [
                 "аффилейт агентство казино",
                 "маркетинговое агентство iGaming",
                 "партнерская программа казино",
                 "управление аффилиатами казино",
                 "агентство по трафику для казино",
+                "компания по управлению партнерками казино",
+                "igaming партнерские сети",
             ]
             queries += ru_boost
         queries += en_boost
     else:
-        # Обычный бизнес/каталоги без маркетингового мусора
         generic = [
             f"{base} официальный сайт",
             f"{base} каталог",
@@ -571,70 +609,58 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
         ]
         queries += generic
 
-    # RU+EN дубли, если запрос кириллицей
     if cyr:
-        # простые EN переформулировки основного запроса
         queries += [
             "affiliate marketing companies for casino",
             "casino marketing affiliate agencies",
             "igaming affiliate marketing companies",
             "casino affiliate management services",
         ] if intent.get("affiliate") and intent.get("casino") else []
-
-        # дубли с локальными зонами
         queries = maybe_add_ru_site_dupes(queries)
 
-    # remove dups, apply geo bias лёгко (оставим как есть, т.к. выше уже добавили site:.tld)
     queries = list(dict.fromkeys([q for q in queries if q]))[:20]
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, casino={intent.get('casino')}), produced {len(queries)} queries")
     return queries, queries
 
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
-    # регион оставляем пользователю как есть, но под капотом для DDG сделаем ru-ru, если кириллица и регион не задан
-    if region not in REGION_MAP:
-        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
-        region = "wt-wt"
-
-    user_prompt = (user_prompt or "").strip()
-    if not user_prompt:
-        return [user_prompt], [], region, [user_prompt], {"affiliate": False, "learn": False, "business": True, "casino": False}
-
-    intent = detect_intent(user_prompt)
-
-    try:
-        queries, phrases = gemini_expand_queries(user_prompt, region, intent)
-    except Exception as e:
-        logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
-        queries, phrases = fallback_expand_queries(user_prompt, region, intent)
-
-    # для Telegram возьмём исходник + 2 топ фразы
-    telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
-    return queries, phrases, region, telegram_queries, intent
-
-# ========= Build query with negative site filters by intent =========
+# ========= Build query with negative site/url/title filters by intent =========
 NEGATIVE_SITES_FOR_BUSINESS = [
     "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
     "site:hubspot.com","site:coursera.org","site:ibm.com","site:sproutsocial.com",
     "site:digitalmarketinginstitute.com","site:marketermilk.com","site:harvard.edu","site:professional.dce.harvard.edu"
 ]
+NEGATIVE_INURL_FOR_BLOGS = [
+    "inurl:blog","inurl:news","inurl:guide","inurl:guides","inurl:insights","inurl:academy",
+    "inurl:articles","inurl:article","inurl:glossary","inurl:resources","inurl:resource",
+    "inurl:learn","inurl:library","inurl:case-study","inurl:case-studies","inurl:whitepaper","inurl:press"
+]
+NEGATIVE_INTITLE_FOR_BLOGS = [
+    'intitle:"what is"','intitle:"how to"','intitle:"guide"','intitle:"overview"','intitle:"tips"'
+]
 
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
-    # жёстче режем обучалки/вики только если ищем компании в аффилиейт-казино контексте
     if intent.get("business") and (intent.get("affiliate") and intent.get("casino")):
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS)
-        return f"{q} {negatives}".strip()
+        negatives_inurl = " ".join(f"-{s}" for s in NEGATIVE_INURL_FOR_BLOGS)
+        negatives_intitle = " ".join(f"-{s}" for s in NEGATIVE_INTITLE_FOR_BLOGS)
+        return f"{q} {negatives} {negatives_inurl} {negatives_intitle}".strip()
     elif intent.get("business") and not intent.get("learn"):
-        # базово отминусуем вики, но не агрессивно
         negatives = " ".join(f"-{s}" for s in NEGATIVE_SITES_FOR_BUSINESS[:3])
         return f"{q} {negatives}".strip()
     return q
 
 # ========= Blog/article cut ONLY for affiliate+casino+business =========
 BLOG_URL_TOKENS = [
-    "/blog", "/news", "/article", "/articles", "/guides", "/guide", "/insights", "/academy", "/glossary"
+    "/blog", "/news", "/article", "/articles", "/guides", "/guide", "/insights", "/academy", "/glossary",
+    "/resources", "/resource", "/learn", "/library", "/case-study", "/case-studies", "/whitepaper", "/press", "/press-release"
 ]
-BLOG_TEXT_TOKENS_RU = ["статья", "советы", "обзор", "гайд", "руководство", "как начать", "что такое"]
-BLOG_TEXT_TOKENS_EN = ["article", "guide", "what is", "how to", "tips", "overview", "best practices"]
+BLOG_TEXT_TOKENS_RU = [
+    "статья", "советы", "обзор", "гайд", "руководство", "как начать", "что такое", "инсайты", "новости",
+    "пример", "кейс", "кейс-стади", "исследование", "белая книга", "пресс-релиз", "учебник", "обучение", "курс"
+]
+BLOG_TEXT_TOKENS_EN = [
+    "article", "guide", "what is", "how to", "tips", "overview", "insights", "news",
+    "case study", "case studies", "research", "whitepaper", "press release", "academy", "resource", "library"
+]
 
 def looks_like_blog(url: str, text: str) -> bool:
     u = (url or "").lower()
@@ -737,7 +763,6 @@ def telegram_search(queries, prompt_phrases):
 
     try:
         if not client.is_user_authorized():
-            # два пути: авто по TELEGRAM_LOGIN_CODE ИЛИ обычный send_code_request → sign_in → 2FA
             try:
                 client.send_code_request(PHONE_NUMBER, force_sms=os.getenv("TELEGRAM_FORCE_SMS","false").lower()=="true")
                 if TELEGRAM_LOGIN_CODE:
@@ -766,7 +791,6 @@ def telegram_search(queries, prompt_phrases):
             try:
                 result = client(SearchRequest(q=q, limit=10))
                 for chat in result.chats:
-                    # берём публичные каналы/суперчаты (без мегагрупп, чтобы выдавать паблики/каналы)
                     if hasattr(chat, "megagroup") and not chat.megagroup:
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
@@ -811,7 +835,6 @@ def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> b
     return False
 
 def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
-    # Жёсткий срез блогов/гайдов только если affiliate+casino+business
     if intent.get("business") and intent.get("affiliate") and intent.get("casino"):
         return looks_like_blog(url, text)
     return False
@@ -819,7 +842,7 @@ def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
 def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool]):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
-    urls = list(dict.fromkeys(urls))[:80]  # повысим потолок
+    urls = list(dict.fromkeys(urls))[:80]
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
         if domain_of(url) in BAD_DOMAINS:
@@ -865,19 +888,16 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                 if el:
                     country = clean_description(el.text)
 
-                # Отсекаем спорт-мусор
                 if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
 
-                # Вики/определения — если бизнес-кейс
                 if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
 
-                # Жёсткий срез блогов — только в affiliate+casino+business
                 if should_cut_blog(url, description, intent):
                     logger.info(f"Skip blog/guide page in affiliate+casino case: {url}")
                     success = True
@@ -1068,7 +1088,6 @@ def search():
                 continue
             if looks_like_sports_garbage(txt):
                 continue
-            # в бизнес кейсе выкидываем вики/обучалки; блоги — только если affiliate+casino
             if intent.get("business") and not intent.get("learn") and dom in KNOWLEDGE_DOMAINS:
                 continue
             if should_cut_blog(r.get("website",""), txt, intent):
@@ -1169,14 +1188,13 @@ def tg_confirm():
     if not (API_ID and API_HASH and PHONE_NUMBER):
         return jsonify({"error": "TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_PHONE not set"}), 400
 
-    data = request.json or {}
-    code = (data.get("code") or "").strip()
-    password = data.get("password")  # 2FA
-    if not code:
-        return jsonify({"error": "code is required"}), 400
-
     client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
     try:
+        code = (request.json or {}).get("code", "").strip()
+        password = (request.json or {}).get("password")
+        if not code:
+            return jsonify({"error": "code is required"}), 400
+
         client.connect()
         if client.is_user_authorized():
             s = StringSession.save(client.session)
