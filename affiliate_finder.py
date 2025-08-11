@@ -622,6 +622,39 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, casino={intent.get('casino')}), produced {len(queries)} queries")
     return queries, queries
 
+# ========= Generate queries (wrapper) =========
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
+    """
+    Обёртка, которая:
+    - нормализует регион,
+    - определяет intent,
+    - пытается Gemini → при ошибке падает в fallback,
+    - собирает telegram_queries.
+    Возвращает: (web_queries, prompt_phrases, region, telegram_queries, intent)
+    """
+    # нормализуем регион
+    if region not in REGION_MAP:
+        logging.warning(f"Invalid region {region}, defaulting to wt-wt")
+        region = "wt-wt"
+
+    user_prompt = (user_prompt or "").strip()
+    if not user_prompt:
+        return [user_prompt], [], region, [user_prompt], {
+            "affiliate": False, "learn": False, "business": True, "casino": False
+        }
+
+    intent = detect_intent(user_prompt)
+
+    try:
+        web_queries, phrases = gemini_expand_queries(user_prompt, region, intent)
+    except Exception as e:
+        logging.warning(f"Gemini failed or invalid output: {e}. Falling back.")
+        web_queries, phrases = fallback_expand_queries(user_prompt, region, intent)
+
+    # подсобный набор для телеги
+    telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
+
+    return web_queries, phrases, region, telegram_queries, intent
 # ========= Build query with negative site/url/title filters by intent =========
 NEGATIVE_SITES_FOR_BUSINESS = [
     "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
