@@ -10,6 +10,7 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
+import asyncio
 
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
@@ -332,6 +333,22 @@ BAD_DOMAINS = {
     "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
 }
+def is_bad_domain(dom: str) -> bool:
+    if not dom:
+        return False
+    d = dom.lower().lstrip(".")
+    # общие паттерны
+    if d.endswith("wikipedia.org"):
+        return True
+    if d.startswith("google.") or d.endswith(".google.com") or d == "google.com":
+        return True
+    # отрезаем www.
+    if d.startswith("www."):
+        d = d[4:]
+    # точное совпадение с «плохими»
+    if d in BAD_DOMAINS:
+        return True
+    return False
 
 KNOWLEDGE_DOMAINS = {
     "wikipedia.org","en.wikipedia.org","ru.wikipedia.org",
@@ -472,9 +489,9 @@ def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
 
 # ========= Intent-agnostic analysis =========
 def is_relevant_url(url, prompt_phrases):
-    u = (url or "").lower()
-    if any(bad in u for bad in BAD_DOMAINS):
+    if is_bad_domain(domain_of(url)):
         return False
+    u = (url or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
 
@@ -801,7 +818,7 @@ def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bo
                     urls.append(href)
         save_request_count(data["count"] + 1)
         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-        urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
+        urls = [u for u in urls if not is_bad_domain(domain_of(u))]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
         logger.error(f"DDG failed for '{q}': {e}")
@@ -824,7 +841,7 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]
             if it.get("link"):
                 urls.append(it["link"])
         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-        urls = [u for u in urls if domain_of(u) not in BAD_DOMAINS]
+        urls = [u for u in urls if not is_bad_domain(domain_of(u))]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
         logger.error(f"SerpAPI failed for '{q}': {e}")
@@ -850,6 +867,14 @@ def get_tg_client():
     API_HASH = os.getenv("TELEGRAM_API_HASH", "")
     if not (API_ID and API_HASH):
         return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
+
+    # >>> добавь вот это <<<
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # <<< до сюда >>>
 
     string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
     proxy = _tg_proxy_tuple()
@@ -968,7 +993,7 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
     urls = list(dict.fromkeys(urls))[:80]
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
-        if domain_of(url) in BAD_DOMAINS:
+        if is_bad_domain(domain_of(url)):
             logger.info(f"Skip bad domain: {url}")
             continue
         proxy_attempts = 0
@@ -1213,7 +1238,7 @@ def search():
                 )
 
         # Дедуп и отсев мусора по доменам
-        all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
+        all_urls = [u for u in list(dict.fromkeys(all_urls)) if not is_bad_domain(domain_of(u))]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
         # Скрейп
@@ -1228,7 +1253,8 @@ def search():
         for r in all_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
             dom = domain_of(r.get("website",""))
-            if dom in BAD_DOMAINS:
+            
+            if is_bad_domain(dom):
                 continue
             if looks_like_sports_garbage(txt):
                 continue
