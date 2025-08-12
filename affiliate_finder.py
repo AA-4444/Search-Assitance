@@ -73,7 +73,6 @@ app = Flask(
     static_url_path="/"
 )
 
-init_db()
 
 # ========= CORS =========
 ALLOWED_ORIGINS = {
@@ -266,7 +265,8 @@ def init_db():
         logger.info("Database initialized")
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
-
+# ВАЖНО: под gunicorn блок __main__ не срабатывает — инициируем БД при импорте
+init_db()
 # ========= Utility: counters & proxies =========
 def load_request_count():
     try:
@@ -1141,7 +1141,6 @@ def prefer_country_results(rows: List[dict], region: str) -> List[dict]:
     b = [r for r in rows if not domain_of(r.get("website","")).endswith(tld)]
     return a + b
 
-# ========= API =========
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     if request.method == "OPTIONS":
@@ -1169,58 +1168,62 @@ def search():
 
         logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
 
-      with sqlite3.connect(DB_PATH) as conn:
-    cursor = conn.cursor()
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS results (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            website TEXT,
-            description TEXT,
-            specialization TEXT,
-            country TEXT,
-            source TEXT,
-            status TEXT,
-            suitability TEXT,
-            score REAL
-        )"""
-    )
-    cursor.execute("DELETE FROM results")
-    conn.commit()
-   
+        # Очистим текущую выдачу (без DROP, чтобы не гоняться с воркерами)
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS results (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    website TEXT,
+                    description TEXT,
+                    specialization TEXT,
+                    country TEXT,
+                    source TEXT,
+                    status TEXT,
+                    suitability TEXT,
+                    score REAL
+                )"""
+            )
+            cursor.execute("DELETE FROM results")
+            conn.commit()
 
-        # Query record
+        # Генерация подзапросов
         web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
+
+        # Запишем сам запрос в историю — вернётся query_id
         query_id = insert_query_record(user_query, intent, region)
+
+        # Учитываем «обучение»: бусты по доменам
+        boosts = history_boosts(intent, region)
 
         # Если кириллица и регион дефолтный — для DDG используем ru-ru
         force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
 
-        # Исторические бусты (маленькие, безопасные)
-        boosts = history_boosts(intent, region)
-
+        # Собираем URL’ы
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
-                all_urls.extend(duckduckgo_search(q, max_results=max_results, region=region, intent=intent, force_ru_ddg=force_ru_ddg))
+                all_urls.extend(
+                    duckduckgo_search(q, max_results=max_results, region=region, intent=intent, force_ru_ddg=force_ru_ddg)
+                )
             if engine in ("serpapi", "both"):
-                all_urls.extend(serpapi_search(q, max_results=max_results, region=region, intent=intent))
+                all_urls.extend(
+                    serpapi_search(q, max_results=max_results, region=region, intent=intent)
+                )
 
+        # Дедуп и отсев мусора по доменам
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if domain_of(u) not in BAD_DOMAINS]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
-        # Scrape
+        # Скрейп
         web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
 
-        # Telegram (optional)
+        # Телега (опционально)
         telegram_results = telegram_search(telegram_queries, prompt_phrases, boosts) if use_telegram else []
-        # Сохраняем телеграм-результаты в историю тоже
-        for r in telegram_results:
-            save_result_records(r, intent, region, query_id)
-
         all_results = web_results + telegram_results
 
-        # Hard cleanup pass
+        # Жёсткая финальная чистка
         filtered = []
         for r in all_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
@@ -1239,7 +1242,7 @@ def search():
         all_results = prefer_country_results(filtered, region)
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
-        # Exports (из текущей таблицы results — как раньше)
+        # Экспорты
         save_to_csv()
         save_to_txt()
 
@@ -1247,8 +1250,7 @@ def search():
             "results": all_results,
             "telegram_enabled": use_telegram,
             "region": region,
-            "engine": engine,
-            "query_id": query_id
+            "engine": engine
         })
     except Exception as e:
         logger.error(f"API error: {e}")
