@@ -73,6 +73,8 @@ app = Flask(
     static_url_path="/"
 )
 
+init_db()
+
 # ========= CORS =========
 ALLOWED_ORIGINS = {
     "http://localhost:8080",
@@ -1167,11 +1169,25 @@ def search():
 
         logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
 
-        # Чистим только таблицу текущей выдачи (история НЕ трогаем)
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM results")
-            conn.commit()
+      with sqlite3.connect(DB_PATH) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        """CREATE TABLE IF NOT EXISTS results (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            website TEXT,
+            description TEXT,
+            specialization TEXT,
+            country TEXT,
+            source TEXT,
+            status TEXT,
+            suitability TEXT,
+            score REAL
+        )"""
+    )
+    cursor.execute("DELETE FROM results")
+    conn.commit()
+   
 
         # Query record
         web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
