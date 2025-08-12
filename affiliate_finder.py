@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
 import asyncio
 
+
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -868,27 +869,29 @@ def get_tg_client():
     if not (API_ID and API_HASH):
         return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
 
-    # >>> добавь вот это <<<
+    
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    # <<< до сюда >>>
 
     string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
     proxy = _tg_proxy_tuple()
+
     try:
         if string_session:
             client = TelegramClient(StringSession(string_session), API_ID, API_HASH, proxy=proxy)
         else:
             os.makedirs("data", exist_ok=True)
             client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH, proxy=proxy)
+
         client.connect()
         return client, None
     except Exception as e:
         return None, f"Failed to init Telegram client: {e}"
-
+        
+        
 def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
     if not TELEGRAM_ENABLED:
         logger.info("Telegram search disabled")
@@ -1372,6 +1375,11 @@ def tg_send_code():
 
 @app.route("/telegram/confirm", methods=["POST"])
 def tg_confirm():
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     """
     body = { "code": "12345", "password": "опц. 2FA" }
     В ответ отдаём StringSession — положи в ENV TELEGRAM_STRING_SESSION.
