@@ -8,7 +8,7 @@ import random
 import logging
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
 
 from bs4 import BeautifulSoup
@@ -19,7 +19,6 @@ from flask_cors import CORS
 CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 def clean_text(text: str) -> str:
-    """Убираем ```json...```, крайние кавычки/апострофы и лишние крайние скобки."""
     if not text:
         return ""
     t = text.strip()
@@ -30,7 +29,6 @@ def clean_text(text: str) -> str:
     return t
 
 def clean_description(description):
-    """Убираем HTML и сокращаем до ~200 слов."""
     if not description:
         return "N/A"
     soup = BeautifulSoup(str(description), "html.parser")
@@ -57,6 +55,10 @@ if TELEGRAM_ENABLED:
     from telethon.sessions import StringSession
     from telethon.tl.functions.contacts import SearchRequest
     from telethon.errors import SessionPasswordNeededError, FloodWaitError
+    try:
+        import socks  # PySocks
+    except Exception:
+        socks = None
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # укажи в Railway
@@ -115,7 +117,6 @@ REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 from ddgs import DDGS
 
 REGION_MAP = {
-    # Global / базовые
     "wt-wt": {"hl": "en", "gl": "us"},
     "us-en": {"hl": "en", "gl": "us"},
     "uk-en": {"hl": "en", "gl": "gb"},
@@ -123,8 +124,6 @@ REGION_MAP = {
     "fr-fr": {"hl": "fr", "gl": "fr"},
     "ru-ru": {"hl": "ru", "gl": "ru"},
     "ua-ua": {"hl": "uk", "gl": "ua"},
-
-    # СНГ
     "kz-ru": {"hl": "ru", "gl": "kz"},
     "kz-kk": {"hl": "kk", "gl": "kz"},
     "by-ru": {"hl": "ru", "gl": "by"},
@@ -133,8 +132,6 @@ REGION_MAP = {
     "kg-ru": {"hl": "ru", "gl": "kg"},
     "am-ru": {"hl": "ru", "gl": "am"},
     "ge-ka": {"hl": "ka", "gl": "ge"},
-
-    # Европа
     "pl-pl": {"hl": "pl", "gl": "pl"},
     "es-es": {"hl": "es", "gl": "es"},
     "it-it": {"hl": "it", "gl": "it"},
@@ -147,8 +144,6 @@ REGION_MAP = {
     "ro-ro": {"hl": "ro", "gl": "ro"},
     "hu-hu": {"hl": "hu", "gl": "hu"},
     "ch-de": {"hl": "de", "gl": "ch"},
-
-    # Азия / Ближний Восток
     "tr-tr": {"hl": "tr", "gl": "tr"},
     "ae-en": {"hl": "en", "gl": "ae"},
     "sa-ar": {"hl": "ar", "gl": "sa"},
@@ -163,8 +158,6 @@ REGION_MAP = {
     "jp-ja": {"hl": "ja", "gl": "jp"},
     "kr-ko": {"hl": "ko", "gl": "kr"},
     "cn-zh": {"hl": "zh", "gl": "cn"},
-
-    # Америка/Океания
     "ca-en": {"hl": "en", "gl": "ca"},
     "br-pt": {"hl": "pt", "gl": "br"},
     "mx-es": {"hl": "es", "gl": "mx"},
@@ -202,11 +195,14 @@ def init_classifier():
 classifier = init_classifier()
 
 # ========= DB =========
+DB_PATH = "search_results.db"
+
 def init_db():
     try:
-        with sqlite3.connect("search_results.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            # Текущая выдача (как раньше) — будет чиститься на каждый запрос
+            c.execute(
                 """CREATE TABLE IF NOT EXISTS results (
                     id TEXT PRIMARY KEY,
                     name TEXT,
@@ -218,6 +214,50 @@ def init_db():
                     status TEXT,
                     suitability TEXT,
                     score REAL
+                )"""
+            )
+            # История запросов
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS queries (
+                    id TEXT PRIMARY KEY,
+                    text TEXT,
+                    intent_json TEXT,
+                    region TEXT,
+                    created_at TEXT
+                )"""
+            )
+            # История результатов
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS results_history (
+                    id TEXT PRIMARY KEY,
+                    query_id TEXT,
+                    url TEXT,
+                    domain TEXT,
+                    source TEXT,
+                    score REAL,
+                    intent_json TEXT,
+                    region TEXT,
+                    created_at TEXT
+                )"""
+            )
+            # Взаимодействия пользователя (клики/оценки)
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS interactions (
+                    id TEXT PRIMARY KEY,
+                    query_id TEXT,
+                    url TEXT,
+                    domain TEXT,
+                    action TEXT,
+                    weight REAL,
+                    created_at TEXT
+                )"""
+            )
+            # Кэш Gemini (простая таблица)
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS gemini_cache (
+                    key TEXT PRIMARY KEY,
+                    data TEXT,
+                    created_at TEXT
                 )"""
             )
             conn.commit()
@@ -291,7 +331,6 @@ BAD_DOMAINS = {
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
 }
 
-# домены справочников/обучалок
 KNOWLEDGE_DOMAINS = {
     "wikipedia.org","en.wikipedia.org","ru.wikipedia.org",
     "hubspot.com","coursera.org","ibm.com","sproutsocial.com",
@@ -331,7 +370,7 @@ def detect_intent(q: str) -> Dict[str, bool]:
         "affiliate": affiliate,
         "learn": learn,
         "casino": casino,
-        "business": not learn  # по умолчанию считаем, что ищем компании/каталоги
+        "business": not learn
     }
 
 # ========= Cyrillic helpers =========
@@ -341,20 +380,93 @@ def is_cyrillic(text: str) -> bool:
     return bool(CYRILLIC_RE.search(text or ""))
 
 def maybe_add_ru_site_dupes(queries: List[str]) -> List[str]:
-    # добавляем дубли поиска по .ru/.ua/.by
     add = []
     for q in queries:
         add.append(q)
         add.append(f"{q} site:.ru")
         add.append(f"{q} site:.ua")
         add.append(f"{q} site:.by")
-    # убираем дубликаты сохраняя порядок
     seen = set()
     out = []
     for x in add:
         if x not in seen:
             out.append(x); seen.add(x)
     return out
+
+# ========= History helpers (learning) =========
+def insert_query_record(text: str, intent: Dict[str,bool], region: str) -> str:
+    qid = str(uuid.uuid4())
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO queries (id, text, intent_json, region, created_at) VALUES (?, ?, ?, ?, ?)",
+                      (qid, text, json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat()))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to insert query: {e}")
+    return qid
+
+def cache_get(key: str, max_age_hours: int = 12) -> Any:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT data, created_at FROM gemini_cache WHERE key=?", (key,))
+            row = c.fetchone()
+            if not row:
+                return None
+            data, created_at = row
+            try:
+                if datetime.utcnow() - datetime.fromisoformat(created_at) > timedelta(hours=max_age_hours):
+                    return None
+            except Exception:
+                return None
+            return json.loads(data)
+    except Exception:
+        return None
+
+def cache_set(key: str, data: Any):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO gemini_cache (key, data, created_at) VALUES (?, ?, ?)",
+                      (key, json.dumps(data, ensure_ascii=False), datetime.utcnow().isoformat()))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to write cache: {e}")
+
+def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
+    """Собираем маленькие бусты по доменам на основе истории и фидбэка."""
+    boosts: Dict[str, float] = {}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            # Частота появления доменов в похожих intent’ах
+            c.execute("""
+                SELECT domain, COUNT(*) as cnt
+                FROM results_history
+                WHERE intent_json = ? AND region = ?
+                GROUP BY domain
+                HAVING cnt >= 2
+            """, (json.dumps(intent, ensure_ascii=False), region))
+            for domain, cnt in c.fetchall():
+                boosts[domain] = boosts.get(domain, 0.0) + min(0.05 * (1 + (cnt ** 0.5)), 0.2)
+
+            # Полож./отриц. фидбэк
+            c.execute("""
+                SELECT domain,
+                       SUM(CASE WHEN action='good' THEN weight WHEN action='click' THEN weight*0.5 ELSE 0 END) as pos,
+                       SUM(CASE WHEN action='bad' THEN -weight ELSE 0 END) as neg
+                FROM interactions
+                GROUP BY domain
+            """)
+            for domain, pos, neg in c.fetchall():
+                p = pos or 0.0
+                n = neg or 0.0
+                adj = min(0.15 * (1 + (p ** 0.5)) - 0.1 * (1 + (n ** 0.5)), 0.3)
+                boosts[domain] = max(min(boosts.get(domain, 0.0) + adj, 0.3), -0.3)
+    except Exception as e:
+        logger.error(f"history_boosts error: {e}")
+    return boosts
 
 # ========= Intent-agnostic analysis =========
 def is_relevant_url(url, prompt_phrases):
@@ -364,7 +476,6 @@ def is_relevant_url(url, prompt_phrases):
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
 
-# --- GEO hints for biasing
 GEO_HINTS: Dict[str, Dict[str, Any]] = {
     "kz-ru": {"tld": "kz", "tokens": ["Казахстан", "KZ", "Алматы", "Астана", "Astana", "Almaty"]},
     "kz-kk": {"tld": "kz", "tokens": ["Қазақстан", "KZ", "Алматы", "Астана"]},
@@ -400,7 +511,6 @@ GEO_HINTS: Dict[str, Dict[str, Any]] = {
 }
 
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
-    """Добавляем к первым подзапросам страновой контекст и site:.tld."""
     hint = GEO_HINTS.get(region)
     if not hint:
         return queries
@@ -429,13 +539,12 @@ def geo_score_boost(url: str, text: str, region: str) -> float:
         boost += 0.15
     return min(boost, 0.5)
 
-# --- company-like url tokens for scoring
 COMPANY_URL_TOKENS = [
     "agency","network","partners","program","programs","platform","services","solutions",
     "management","consulting","company","about","contact","affiliates"
 ]
 
-def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None) -> float:
+def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None, boosts: Dict[str,float]=None) -> float:
     score = 0.0
     d = (description or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
@@ -448,13 +557,13 @@ def rank_result(description: str, prompt_phrases: List[str], url: str = None, re
     if "t.me" in d or "instagram.com" in d:
         score += 0.2
 
-    # бонус за company-like URL’ы
     if url:
         uu = url.lower()
         if any(tok in uu for tok in COMPANY_URL_TOKENS):
-            score += 0.3  # слегка подталкиваем вверх компании/агентства
+            score += 0.3
+        if boosts:
+            score += boosts.get(domain_of(url), 0.0)
 
-    # понижаем блоги/новости
     if url and looks_like_blog(url, d):
         score = max(score - 0.4, 0.0)
 
@@ -462,7 +571,7 @@ def rank_result(description: str, prompt_phrases: List[str], url: str = None, re
         score = min(score, 0.2)
     if url and region:
         score += geo_score_boost(url, d, region)
-    return min(score, 1.0)
+    return min(max(score, 0.0), 1.0)
 
 def analyze_result(description, prompt_phrases):
     specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
@@ -485,7 +594,6 @@ def analyze_result(description, prompt_phrases):
 
 # ========= Query generation with Gemini + fallback =========
 def _extract_json_array_maybe(text: str) -> List[str]:
-    """Страховка: вытащить первый JSON-массив из произвольной строки."""
     if not text:
         return []
     try:
@@ -494,15 +602,14 @@ def _extract_json_array_maybe(text: str) -> List[str]:
             return val
     except Exception:
         pass
-    m = re.search(r"$begin:math:display$.*$end:math:display$", text, flags=re.DOTALL)
-    if not m:
-        return []
-    try:
-        val = json.loads(m.group(0))
-        if isinstance(val, list):
-            return val
-    except Exception:
-        return []
+    m = re.search(r"$begin:math:display$[\\s\\S]*$end:math:display$", text)
+    if m:
+        try:
+            val = json.loads(m.group(0))
+            if isinstance(val, list):
+                return val
+        except Exception:
+            return []
     return []
 
 def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]) -> Tuple[List[str], List[str]]:
@@ -510,13 +617,19 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
         raise RuntimeError("GEMINI_API_KEY is not set")
 
     system_instruction = (
-        "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 8–12 коротких поисковых запросов по теме. "
-        "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова вроде 'affiliate', 'CPA', 'referral'. "
+        "Ты помощник для поиска. Преобразуй запрос пользователя в массив из 8–12 КОРОТКИХ поисковых запросов по теме. "
+        "Если запрос НЕ про аффилиатки/партнёрские программы — НЕ добавляй слова 'affiliate', 'CPA', 'referral'. "
         "Если запрос про аффилиатки — добавь релевантные англоязычные термины (agency, network, program, platform, services). "
-        "НЕ пиши комментарии, не добавляй текст вне JSON. Верни ТОЛЬКО JSON-массив строк."
+        "Ответи строго JSON-массивом строк без комментариев."
     )
     guard = "AFFILIATE=YES" if intent.get("affiliate") else "AFFILIATE=NO"
     user_text = f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."
+
+    # cache
+    cache_key = f"gemini:{region}:{json.dumps(intent, sort_keys=True, ensure_ascii=False)}:{user_prompt}".strip()
+    cached = cache_get(cache_key, max_age_hours=12)
+    if cached:
+        return cached[:12], cached[:12]
 
     body = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
@@ -549,6 +662,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
         arr = [clean_text(str(x)) for x in arr if isinstance(x, (str, int, float))]
         arr = [x for x in arr if x and len(x) <= 200]
         if arr:
+            cache_set(cache_key, arr)
             logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
             return arr[:12], arr[:12]
 
@@ -563,59 +677,33 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
 
     if intent.get("affiliate"):
         en_boost = [
-            "affiliate programs",
-            "partner program application",
-            "affiliate marketing",
-            "referral program",
-            "CPA affiliate",
-            "best affiliate networks",
-            "affiliate agency",
-            "affiliate management agency",
+            "affiliate programs","partner program application","affiliate marketing","referral program",
+            "CPA affiliate","best affiliate networks","affiliate agency","affiliate management agency",
         ]
         if intent.get("casino"):
             en_boost += [
-                "casino affiliate programs",
-                "iGaming affiliate agency",
-                "casino affiliate marketing agency",
-                "online casino affiliates",
-                "gambling affiliate networks",
-                "igaming growth agency",
-                "casino affiliate management company",
-                "igaming affiliate network",
-                "casino affiliate platform services",
+                "casino affiliate programs","iGaming affiliate agency","casino affiliate marketing agency",
+                "online casino affiliates","gambling affiliate networks","igaming growth agency",
+                "casino affiliate management company","igaming affiliate network","casino affiliate platform services",
             ]
             ru_boost = [
-                "аффилейт агентство казино",
-                "маркетинговое агентство iGaming",
-                "партнерская программа казино",
-                "управление аффилиатами казино",
-                "агентство по трафику для казино",
-                "компания по управлению партнерками казино",
-                "igaming партнерские сети",
+                "аффилейт агентство казино","маркетинговое агентство iGaming","партнерская программа казино",
+                "управление аффилиатами казино","агентство по трафику для казино",
+                "компания по управлению партнерками казино","igaming партнерские сети",
             ]
             queries += ru_boost
         queries += en_boost
     else:
-        generic = [
-            f"{base} официальный сайт",
-            f"{base} каталог",
-            f"{base} список",
-            f"{base} компании",
-            f"{base} directory",
-            f"{base} companies",
-            f"{base} official site",
-            f"{base} contacts",
-            f"{base} услуги",
-        ]
-        queries += generic
-
-    if cyr:
         queries += [
-            "affiliate marketing companies for casino",
-            "casino marketing affiliate agencies",
-            "igaming affiliate marketing companies",
-            "casino affiliate management services",
-        ] if intent.get("affiliate") and intent.get("casino") else []
+            f"{base} официальный сайт", f"{base} каталог", f"{base} список", f"{base} компании",
+            f"{base} directory", f"{base} companies", f"{base} official site", f"{base} contacts", f"{base} услуги",
+        ]
+
+    if cyr and intent.get("affiliate") and intent.get("casino"):
+        queries += [
+            "affiliate marketing companies for casino","casino marketing affiliate agencies",
+            "igaming affiliate marketing companies","casino affiliate management services",
+        ]
         queries = maybe_add_ru_site_dupes(queries)
 
     queries = list(dict.fromkeys([q for q in queries if q]))[:20]
@@ -624,15 +712,6 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
 
 # ========= Generate queries (wrapper) =========
 def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
-    """
-    Обёртка, которая:
-    - нормализует регион,
-    - определяет intent,
-    - пытается Gemini → при ошибке падает в fallback,
-    - собирает telegram_queries.
-    Возвращает: (web_queries, prompt_phrases, region, telegram_queries, intent)
-    """
-    # нормализуем регион
     if region not in REGION_MAP:
         logging.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
@@ -651,11 +730,10 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         logging.warning(f"Gemini failed or invalid output: {e}. Falling back.")
         web_queries, phrases = fallback_expand_queries(user_prompt, region, intent)
 
-    # подсобный набор для телеги
     telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
-
     return web_queries, phrases, region, telegram_queries, intent
-# ========= Build query with negative site/url/title filters by intent =========
+
+# ========= Build query with negative filters =========
 NEGATIVE_SITES_FOR_BUSINESS = [
     "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
     "site:hubspot.com","site:coursera.org","site:ibm.com","site:sproutsocial.com",
@@ -681,7 +759,7 @@ def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
         return f"{q} {negatives}".strip()
     return q
 
-# ========= Blog/article cut ONLY for affiliate+casino+business =========
+# ========= Blog/article cut =========
 BLOG_URL_TOKENS = [
     "/blog", "/news", "/article", "/articles", "/guides", "/guide", "/insights", "/academy", "/glossary",
     "/resources", "/resource", "/learn", "/library", "/case-study", "/case-studies", "/whitepaper", "/press", "/press-release"
@@ -751,8 +829,18 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]
         return []
 
 # ========= Telegram (client helper + endpoints + search) =========
+def _tg_proxy_tuple():
+    host = os.getenv("TELEGRAM_PROXY_HOST", "").strip()
+    port = int(os.getenv("TELEGRAM_PROXY_PORT", "0") or "0")
+    user = os.getenv("TELEGRAM_PROXY_USER", "").strip() or None
+    pwd = os.getenv("TELEGRAM_PROXY_PASS", "").strip() or None
+    if host and port and socks:
+        return (socks.SOCKS5, host, port, True, user, pwd)
+    if host and port and not socks:
+        logger.warning("TELEGRAM_PROXY_* set but PySocks is not installed; proxy ignored")
+    return None
+
 def get_tg_client():
-    """Создаёт/возвращает Telethon-клиент со строковой сессией (если задана) или сессией-файлом."""
     if not TELEGRAM_ENABLED:
         return None, "TELEGRAM_ENABLED is false"
 
@@ -762,18 +850,19 @@ def get_tg_client():
         return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
 
     string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+    proxy = _tg_proxy_tuple()
     try:
         if string_session:
-            client = TelegramClient(StringSession(string_session), API_ID, API_HASH)
+            client = TelegramClient(StringSession(string_session), API_ID, API_HASH, proxy=proxy)
         else:
             os.makedirs("data", exist_ok=True)
-            client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
+            client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH, proxy=proxy)
         client.connect()
         return client, None
     except Exception as e:
         return None, f"Failed to init Telegram client: {e}"
 
-def telegram_search(queries, prompt_phrases):
+def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
     if not TELEGRAM_ENABLED:
         logger.info("Telegram search disabled")
         return []
@@ -795,9 +884,12 @@ def telegram_search(queries, prompt_phrases):
         return results
 
     try:
-        if not client.is_user_authorized():
+        if not client.is_user_authorized() and not os.getenv("TELEGRAM_STRING_SESSION"):
             try:
-                client.send_code_request(PHONE_NUMBER, force_sms=os.getenv("TELEGRAM_FORCE_SMS","false").lower()=="true")
+                force_sms = os.getenv("TELEGRAM_FORCE_SMS","false").lower()=="true"
+                where = "sms" if force_sms else "telegram_app"
+                logger.info(f"Telegram: sending code to {where}")
+                client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
                 if TELEGRAM_LOGIN_CODE:
                     try:
                         client.sign_in(PHONE_NUMBER, TELEGRAM_LOGIN_CODE)
@@ -828,10 +920,9 @@ def telegram_search(queries, prompt_phrases):
                         name = chat.title or "N/A"
                         username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
                         description = clean_description(getattr(chat, "description", "N/A"))
-                        is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
-                        score = rank_result(description, prompt_phrases, url=username)
+                        score = rank_result(description, prompt_phrases, url=username, boosts=boosts)
                         if is_relevant_url(username, prompt_phrases) or score > 0.1:
-                            row = {
+                            results.append({
                                 "id": str(uuid.uuid4()),
                                 "name": name,
                                 "website": username,
@@ -839,9 +930,7 @@ def telegram_search(queries, prompt_phrases):
                                 "country": "N/A",
                                 "source": "Telegram",
                                 "score": score,
-                            }
-                            results.append(row)
-                            save_to_db(row, is_rel, spec, status, suit, score)
+                            })
                         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
             except FloodWaitError as e:
                 logger.warning(f"Telegram rate limit, waiting {e.seconds}s")
@@ -855,7 +944,6 @@ def telegram_search(queries, prompt_phrases):
 
 # ========= Scraper & filters =========
 def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> bool:
-    """Отсекаем обучалки/вики, если пользователь ищет компании/партнёров."""
     if not intent.get("business") or intent.get("learn"):
         return False
     t = (text or "").lower()
@@ -872,7 +960,7 @@ def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
         return looks_like_blog(url, text)
     return False
 
-def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool]):
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
     urls = list(dict.fromkeys(urls))[:80]
@@ -925,19 +1013,16 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
-
                 if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
-
                 if should_cut_blog(url, description, intent):
                     logger.info(f"Skip blog/guide page in affiliate+casino case: {url}")
                     success = True
                     break
 
-                is_rel, spec, status, suit = analyze_result(description, prompt_phrases)
-                score = rank_result(description, prompt_phrases, url=url, region=region)
+                score = rank_result(description, prompt_phrases, url=url, region=region, boosts=boosts)
                 if is_relevant_url(url, prompt_phrases) or score > 0.1:
                     row = {
                         "id": str(uuid.uuid4()),
@@ -949,7 +1034,7 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                         "score": score,
                     }
                     results.append(row)
-                    save_to_db(row, is_rel, spec, status, suit, score)
+                    save_result_records(row, intent, region, query_id)
                 success = True
                 time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
                 break
@@ -971,26 +1056,39 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
     return results
 
 # ========= Persistence =========
-def save_to_db(result, is_relevant, specialization, status, suitability, score):
+def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str, query_id: str):
+    """Пишем и в кратковременную таблицу results (для текущей выдачи), и в results_history (для обучения)."""
     try:
-        with sqlite3.connect("search_results.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            # В текущую выдачу (как раньше)
+            c.execute(
                 """INSERT OR IGNORE INTO results
                    (id, name, website, description, specialization, country, source, status, suitability, score)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    result["id"], result["name"], result["website"], result["description"],
-                    specialization, result["country"], result["source"], status, suitability, score
+                    row["id"], row.get("name","N/A"), row["website"], row.get("description","N/A"),
+                    ", ".join([]).title(), row.get("country","N/A"), row.get("source","Web"),
+                    "Active", "Подходит", row.get("score",0.0),
                 ),
+            )
+            # В историю
+            c.execute(
+                """INSERT OR IGNORE INTO results_history
+                   (id, query_id, url, domain, source, score, intent_json, region, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), query_id, row["website"], domain_of(row["website"]), row.get("source","Web"),
+                    row.get("score",0.0), json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat()
+                )
             )
             conn.commit()
     except sqlite3.Error as e:
-        logger.error(f"Error saving to SQLite: {e}")
+        logger.error(f"Error saving records: {e}")
 
 def save_to_csv():
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM results ORDER BY score DESC")
             rows = cursor.fetchall()
@@ -1007,7 +1105,7 @@ def save_to_csv():
 
 def save_to_txt():
     try:
-        with sqlite3.connect("search_results.db") as conn:
+        with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM results ORDER BY score DESC")
             rows = cursor.fetchall()
@@ -1069,31 +1167,21 @@ def search():
 
         logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
 
-        # Reset DB for each request
-        with sqlite3.connect("search_results.db") as conn:
+        # Чистим только таблицу текущей выдачи (история НЕ трогаем)
+        with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS results")
-            cursor.execute(
-                """CREATE TABLE results (
-                    id TEXT PRIMARY KEY,
-                    name TEXT,
-                    website TEXT,
-                    description TEXT,
-                    specialization TEXT,
-                    country TEXT,
-                    source TEXT,
-                    status TEXT,
-                    suitability TEXT,
-                    score REAL
-                )"""
-            )
+            cursor.execute("DELETE FROM results")
             conn.commit()
 
-        # Build & collect URLs
+        # Query record
         web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
+        query_id = insert_query_record(user_query, intent, region)
 
-        # Если кириллица и регион дефолтный — под капотом для DDG используем ru-ru
+        # Если кириллица и регион дефолтный — для DDG используем ru-ru
         force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
+
+        # Исторические бусты (маленькие, безопасные)
+        boosts = history_boosts(intent, region)
 
         all_urls = []
         for q in web_queries:
@@ -1106,10 +1194,14 @@ def search():
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
         # Scrape
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent)
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
 
         # Telegram (optional)
-        telegram_results = telegram_search(telegram_queries, prompt_phrases) if use_telegram else []
+        telegram_results = telegram_search(telegram_queries, prompt_phrases, boosts) if use_telegram else []
+        # Сохраняем телеграм-результаты в историю тоже
+        for r in telegram_results:
+            save_result_records(r, intent, region, query_id)
+
         all_results = web_results + telegram_results
 
         # Hard cleanup pass
@@ -1131,7 +1223,7 @@ def search():
         all_results = prefer_country_results(filtered, region)
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
-        # Exports
+        # Exports (из текущей таблицы results — как раньше)
         save_to_csv()
         save_to_txt()
 
@@ -1139,11 +1231,37 @@ def search():
             "results": all_results,
             "telegram_enabled": use_telegram,
             "region": region,
-            "engine": engine
+            "engine": engine,
+            "query_id": query_id
         })
     except Exception as e:
         logger.error(f"API error: {e}")
         return jsonify({"error": str(e)}), 500
+
+# ========= Feedback API =========
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """
+    body: { "query_id": "...", "url": "...", "action": "click|good|bad" }
+    """
+    try:
+        data = request.json or {}
+        query_id = (data.get("query_id") or "").strip()
+        url = (data.get("url") or "").strip()
+        action = (data.get("action") or "").strip().lower()
+        if not (query_id and url and action in {"click","good","bad"}):
+            return jsonify({"error":"query_id, url, action(click|good|bad) required"}), 400
+        weight = 1.0 if action=="click" else (2.0 if action=="good" else 2.0)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                      (str(uuid.uuid4()), query_id, url, domain_of(url), action, weight, datetime.utcnow().isoformat()))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error(f"/feedback error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ========= API aliases /api/* =========
 @app.route("/api/search", methods=["POST", "OPTIONS"])
@@ -1199,9 +1317,11 @@ def tg_send_code():
         return jsonify({"error": err}), 500
     try:
         force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
+        where = "sms" if force_sms else "telegram_app"
+        logger.info(f"Telegram: sending code to {where}")
         client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
         client.disconnect()
-        return jsonify({"ok": True, "sent_to": "sms" if force_sms else "telegram_app"}), 200
+        return jsonify({"ok": True, "sent_to": where}), 200
     except Exception as e:
         client.disconnect()
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1209,8 +1329,8 @@ def tg_send_code():
 @app.route("/telegram/confirm", methods=["POST"])
 def tg_confirm():
     """
-    Подтверждаем вход: body = { "code": "12345", "password": "опц. 2FA" }
-    В ответ отдаём сгенерированный StringSession — скопируй в ENV TELEGRAM_STRING_SESSION.
+    body = { "code": "12345", "password": "опц. 2FA" }
+    В ответ отдаём StringSession — положи в ENV TELEGRAM_STRING_SESSION.
     """
     if not TELEGRAM_ENABLED:
         return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
@@ -1221,7 +1341,8 @@ def tg_confirm():
     if not (API_ID and API_HASH and PHONE_NUMBER):
         return jsonify({"error": "TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_PHONE not set"}), 400
 
-    client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH)
+    proxy = _tg_proxy_tuple()
+    client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH, proxy=proxy)
     try:
         code = (request.json or {}).get("code", "").strip()
         password = (request.json or {}).get("password")
