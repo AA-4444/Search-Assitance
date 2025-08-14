@@ -204,7 +204,8 @@ def init_db():
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            # Текущая выдача (как раньше) — будет чиститься на каждый запрос
+
+            # --- основные таблицы ---
             c.execute(
                 """CREATE TABLE IF NOT EXISTS results (
                     id TEXT PRIMARY KEY,
@@ -219,7 +220,6 @@ def init_db():
                     score REAL
                 )"""
             )
-            # История запросов
             c.execute(
                 """CREATE TABLE IF NOT EXISTS queries (
                     id TEXT PRIMARY KEY,
@@ -229,7 +229,6 @@ def init_db():
                     created_at TEXT
                 )"""
             )
-            # История результатов
             c.execute(
                 """CREATE TABLE IF NOT EXISTS results_history (
                     id TEXT PRIMARY KEY,
@@ -243,7 +242,6 @@ def init_db():
                     created_at TEXT
                 )"""
             )
-            # Взаимодействия пользователя (клики/оценки)
             c.execute(
                 """CREATE TABLE IF NOT EXISTS interactions (
                     id TEXT PRIMARY KEY,
@@ -255,7 +253,6 @@ def init_db():
                     created_at TEXT
                 )"""
             )
-            # Кэш Gemini (простая таблица)
             c.execute(
                 """CREATE TABLE IF NOT EXISTS gemini_cache (
                     key TEXT PRIMARY KEY,
@@ -263,10 +260,44 @@ def init_db():
                     created_at TEXT
                 )"""
             )
+
+            # --- добаляем ТЕЛЕГРАМ-кеш и рейт-лимит ---
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS tg_cache (
+                    q TEXT PRIMARY KEY,
+                    data TEXT,
+                    created_at TEXT
+                )"""
+            )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS tg_rate (
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    minute_count INTEGER DEFAULT 0,
+                    hour_count   INTEGER DEFAULT 0,
+                    day_count    INTEGER DEFAULT 0,
+                    minute_ts TEXT, 
+                    hour_ts   TEXT, 
+                    day_ts    TEXT,
+                    cooldown_until TEXT
+                )"""
+            )
+            # ensure single row
+            c.execute(
+                """INSERT OR IGNORE INTO tg_rate 
+                   (id, minute_count, hour_count, day_count, minute_ts, hour_ts, day_ts, cooldown_until)
+                   VALUES (1, 0, 0, 0, ?, ?, ?, NULL)""",
+                (
+                    datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+
             conn.commit()
         logger.info("Database initialized")
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
+        
 # ВАЖНО: под gunicorn блок __main__ не срабатывает — инициируем БД при импорте
 init_db()
 # ========= Utility: counters & proxies =========
@@ -453,6 +484,111 @@ def cache_set(key: str, data: Any):
             conn.commit()
     except Exception as e:
         logger.error(f"Failed to write cache: {e}")
+
+# ========= Telegram cache & rate-limit helpers =========
+def tg_cache_get(q: str, ttl_sec: int) -> Any:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT data, created_at FROM tg_cache WHERE q=?", (q,))
+            row = c.fetchone()
+            if not row:
+                return None
+            data, created_at = row
+            if datetime.utcnow() - datetime.fromisoformat(created_at) > timedelta(seconds=ttl_sec):
+                return None
+            return json.loads(data)
+    except Exception:
+        return None
+
+def tg_cache_set(q: str, data: Any):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO tg_cache (q, data, created_at) VALUES (?, ?, ?)",
+                (q, json.dumps(data, ensure_ascii=False), datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"tg_cache_set error: {e}")
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+def tg_rate_guard():
+    """Проверяет/сбрасывает счетчики, смотрит cooldown. Возвращает (ok:bool, wait_sec:int|0)."""
+    QPM = _env_int("TG_QPM", 2)    # запросов в минуту
+    QPH = _env_int("TG_QPH", 20)   # в час
+    QPD = _env_int("TG_QPD", 100)  # в сутки
+
+    now = datetime.utcnow()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT minute_count,hour_count,day_count,minute_ts,hour_ts,day_ts,cooldown_until FROM tg_rate WHERE id=1"
+            )
+            mc,hc,dc,mt,ht,dt,cool = c.fetchone()
+
+            # cooldown
+            if cool:
+                cu = datetime.fromisoformat(cool)
+                if now < cu:
+                    return False, int((cu - now).total_seconds())
+
+            # rolling windows
+            mt = datetime.fromisoformat(mt) if mt else now
+            ht = datetime.fromisoformat(ht) if ht else now
+            dt = datetime.fromisoformat(dt) if dt else now
+
+            if (now - mt) >= timedelta(minutes=1):
+                mc = 0; mt = now
+            if (now - ht) >= timedelta(hours=1):
+                hc = 0; ht = now
+            if (now - dt) >= timedelta(days=1):
+                dc = 0; dt = now
+
+            if mc >= QPM or hc >= QPH or dc >= QPD:
+                # мягкий отказ — ждать ближайшее окно
+                wait_min  = max(1, 60   - (now - mt).seconds)
+                wait_hour = max(1, 3600 - (now - ht).seconds)
+                wait_day  = max(1, 86400- (now - dt).seconds)
+                wait_sec = max(5, min(wait_min, wait_hour, wait_day))
+                return False, wait_sec
+
+            # резервируем «токен»
+            mc += 1; hc += 1; dc += 1
+            c.execute(
+                """UPDATE tg_rate 
+                   SET minute_count=?,hour_count=?,day_count=?,minute_ts=?,hour_ts=?,day_ts=?
+                   WHERE id=1""",
+                (mc,hc,dc,mt.isoformat(),ht.isoformat(),dt.isoformat()),
+            )
+            conn.commit()
+            return True, 0
+    except Exception as e:
+        logger.error(f"tg_rate_guard error: {e}")
+        return False, 30  # в сомнительных случаях — подождать
+
+def tg_rate_cooldown(seconds: int):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            cu = (datetime.utcnow() + timedelta(seconds=seconds)).isoformat()
+            c.execute("UPDATE tg_rate SET cooldown_until=?", (cu,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"tg_rate_cooldown error: {e}")
 
 def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
     """Собираем маленькие бусты по доменам на основе истории и фидбэка."""
@@ -901,12 +1037,16 @@ def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
     API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
     API_HASH = os.getenv("TELEGRAM_API_HASH", "")
     PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    TELEGRAM_2FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD", "")
-    TELEGRAM_LOGIN_CODE = os.getenv("TELEGRAM_LOGIN_CODE", "").strip()
 
     if not (API_ID and API_HASH and PHONE_NUMBER):
         logger.error("Telegram env not fully configured; skipping")
         return results
+
+    # Настройки «мягкости»
+    TG_SEARCH_TTL = _env_int("TG_SEARCH_TTL", 6 * 60 * 60)   # 6 часов кеш
+    BASE_SLEEP   = _env_float("TG_BASE_SLEEP", 3.0)          # базовая пауза между запросами
+    JITTER       = _env_float("TG_JITTER", 2.0)              # плюс-минус рандом
+    LIMIT_PER_QUERY = _env_int("TG_LIMIT_PER_QUERY", 5)      # не 10, чтобы мягче
 
     client, err = get_tg_client()
     if err:
@@ -914,45 +1054,51 @@ def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
         return results
 
     try:
-        if not client.is_user_authorized() and not os.getenv("TELEGRAM_STRING_SESSION"):
-            try:
-                force_sms = os.getenv("TELEGRAM_FORCE_SMS","false").lower()=="true"
-                where = "sms" if force_sms else "telegram_app"
-                logger.info(f"Telegram: sending code to {where}")
-                client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-                if TELEGRAM_LOGIN_CODE:
-                    try:
-                        client.sign_in(PHONE_NUMBER, TELEGRAM_LOGIN_CODE)
-                        logger.info("Telegram: signed-in using TELEGRAM_LOGIN_CODE")
-                    except SessionPasswordNeededError:
-                        if TELEGRAM_2FA_PASSWORD:
-                            client.sign_in(password=TELEGRAM_2FA_PASSWORD)
-                            logger.info("Telegram: 2FA password used after TELEGRAM_LOGIN_CODE")
-                        else:
-                            logger.error("Telegram: 2FA enabled but TELEGRAM_2FA_PASSWORD not set")
-                            client.disconnect()
-                            return results
-                else:
-                    logger.info("Telegram code sent. Use /telegram/confirm to finalize login.")
-                    client.disconnect()
-                    return results
-            except Exception as e:
-                logger.error(f"Telegram auth failed: {e}")
-                client.disconnect()
-                return results
+        # Не провоцируем лишнюю авторизацию через код
+        if not client.is_user_authorized():
+            logger.warning("Telegram: not authorized (no STRING_SESSION). Skipping Telegram search.")
+            client.disconnect()
+            return results
 
         for q in queries:
+            q = (q or "").strip()
+            if not q:
+                continue
+
+            # 1) кеш
+            cached = tg_cache_get(q, TG_SEARCH_TTL)
+            if cached:
+                logger.info(f"Telegram cache hit for: {q}")
+                results.extend(cached)
+                time.sleep(BASE_SLEEP + random.uniform(0, JITTER))
+                continue
+
+            # 2) рейт-лимит
+            ok, wait_sec = tg_rate_guard()
+            if not ok:
+                logger.info(f"Telegram rate-guard: wait {wait_sec}s")
+                time.sleep(wait_sec)
+                # после ожидания — ещё раз пытаемся резервировать
+                ok2, wait_sec2 = tg_rate_guard()
+                if not ok2:
+                    logger.info(f"Telegram rate-guard(2): still wait {wait_sec2}s; skip this query")
+                    continue
+
             logger.info(f"Searching Telegram for: {q}")
             try:
-                result = client(SearchRequest(q=q, limit=10))
+                result = client(SearchRequest(q=q, limit=LIMIT_PER_QUERY))
+                rows = []
                 for chat in result.chats:
-                    if hasattr(chat, "megagroup") and not chat.megagroup:
+                    # Берём только публичные каналы/супергруппы с юзернеймом
+                    if getattr(chat, "username", None):
                         name = chat.title or "N/A"
-                        username = f"t.me/{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else "N/A"
-                        description = clean_description(getattr(chat, "description", "N/A"))
+                        username = f"t.me/{chat.username}"
+                        description = clean_description(getattr(chat, "description", ""))
                         score = rank_result(description, prompt_phrases, url=username, boosts=boosts)
+
+                        # Доб. фильтр по релевантности
                         if is_relevant_url(username, prompt_phrases) or score > 0.1:
-                            results.append({
+                            rows.append({
                                 "id": str(uuid.uuid4()),
                                 "name": name,
                                 "website": username,
@@ -961,15 +1107,36 @@ def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
                                 "source": "Telegram",
                                 "score": score,
                             })
-                        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+
+                # кешируем аккуратно именно rows по этому q
+                tg_cache_set(q, rows)
+                results.extend(rows)
+
+                # мягкая пауза между запросами
+                time.sleep(BASE_SLEEP + random.uniform(0, JITTER))
+
             except FloodWaitError as e:
-                logger.warning(f"Telegram rate limit, waiting {e.seconds}s")
-                time.sleep(e.seconds)
+                # Жёсткий сигнал от Telegram — ставим общий cooldown
+                cool = e.seconds + random.randint(5, 20)
+                logger.warning(f"Telegram FloodWait: {e.seconds}s -> cooldown {cool}s")
+                tg_rate_cooldown(cool)
+                time.sleep(min(cool, 60))  # тут не зависаем надолго, остальное «cooldown» отрежет
             except Exception as e:
+                # Например 420 FROZEN_METHOD_INVALID — лучше не долбиться
+                msg = str(e).lower()
                 logger.error(f"Telegram search failed for '{q}': {e}")
+                if "frozen_method_invalid" in msg or "420" in msg:
+                    tg_rate_cooldown(_env_int("TG_FROZEN_COOLDOWN", 1800))  # 30 мин
+                    # не пытаемся дальше — уходим мягко
+                    break
+
         client.disconnect()
     except Exception as e:
         logger.error(f"Telegram client failed: {e}")
+        try:
+            client.disconnect()
+        except:
+            pass
     return results
 
 # ========= Scraper & filters =========
