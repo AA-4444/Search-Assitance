@@ -786,7 +786,7 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
                 "управление аффилиатами казино","агентство по трафику для казино",
                 "компания по управлению партнерками казино","igaming партнерские сети",
             ]
-            queries += ru_boост
+            queries += ru_boost
         queries += en_boost
     else:
         queries += [
@@ -1298,7 +1298,7 @@ def api_search():
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
     if filetype not in ["csv", "txt"]:
-        return jsonify({"error": "Invalid file type, use 'csv' or 'txt"}), 400
+        return jsonify({"error": "Invalid file type, use 'csv' or 'txt'"}), 400
     filename = f"search_results.{filetype}"
     try:
         mimetype = "text/plain" if filetype == "txt" else "text/csv"
