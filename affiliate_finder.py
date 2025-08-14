@@ -10,8 +10,6 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
-import asyncio
-
 
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
@@ -51,17 +49,6 @@ except Exception:
     pipeline = None
 
 # ========= Feature flags / API keys =========
-TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
-if TELEGRAM_ENABLED:
-    from telethon.sync import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.tl.functions.contacts import SearchRequest
-    from telethon.errors import SessionPasswordNeededError, FloodWaitError
-    try:
-        import socks  # PySocks
-    except Exception:
-        socks = None
-
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # укажи в Railway
 
@@ -74,7 +61,6 @@ app = Flask(
     static_folder=FRONTEND_DIST,
     static_url_path="/"
 )
-
 
 # ========= CORS =========
 ALLOWED_ORIGINS = {
@@ -261,45 +247,14 @@ def init_db():
                 )"""
             )
 
-            # --- добаляем ТЕЛЕГРАМ-кеш и рейт-лимит ---
-            c.execute(
-                """CREATE TABLE IF NOT EXISTS tg_cache (
-                    q TEXT PRIMARY KEY,
-                    data TEXT,
-                    created_at TEXT
-                )"""
-            )
-            c.execute(
-                """CREATE TABLE IF NOT EXISTS tg_rate (
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    minute_count INTEGER DEFAULT 0,
-                    hour_count   INTEGER DEFAULT 0,
-                    day_count    INTEGER DEFAULT 0,
-                    minute_ts TEXT, 
-                    hour_ts   TEXT, 
-                    day_ts    TEXT,
-                    cooldown_until TEXT
-                )"""
-            )
-            # ensure single row
-            c.execute(
-                """INSERT OR IGNORE INTO tg_rate 
-                   (id, minute_count, hour_count, day_count, minute_ts, hour_ts, day_ts, cooldown_until)
-                   VALUES (1, 0, 0, 0, ?, ?, ?, NULL)""",
-                (
-                    datetime.utcnow().isoformat(),
-                    datetime.utcnow().isoformat(),
-                    datetime.utcnow().isoformat(),
-                ),
-            )
-
             conn.commit()
         logger.info("Database initialized")
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
-        
+
 # ВАЖНО: под gunicorn блок __main__ не срабатывает — инициируем БД при импорте
 init_db()
+
 # ========= Utility: counters & proxies =========
 def load_request_count():
     try:
@@ -485,111 +440,6 @@ def cache_set(key: str, data: Any):
     except Exception as e:
         logger.error(f"Failed to write cache: {e}")
 
-# ========= Telegram cache & rate-limit helpers =========
-def tg_cache_get(q: str, ttl_sec: int) -> Any:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT data, created_at FROM tg_cache WHERE q=?", (q,))
-            row = c.fetchone()
-            if not row:
-                return None
-            data, created_at = row
-            if datetime.utcnow() - datetime.fromisoformat(created_at) > timedelta(seconds=ttl_sec):
-                return None
-            return json.loads(data)
-    except Exception:
-        return None
-
-def tg_cache_set(q: str, data: Any):
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR REPLACE INTO tg_cache (q, data, created_at) VALUES (?, ?, ?)",
-                (q, json.dumps(data, ensure_ascii=False), datetime.utcnow().isoformat()),
-            )
-            conn.commit()
-    except Exception as e:
-        logger.error(f"tg_cache_set error: {e}")
-
-def _env_float(name, default):
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return float(default)
-
-def _env_int(name, default):
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return int(default)
-
-def tg_rate_guard():
-    """Проверяет/сбрасывает счетчики, смотрит cooldown. Возвращает (ok:bool, wait_sec:int|0)."""
-    QPM = _env_int("TG_QPM", 2)    # запросов в минуту
-    QPH = _env_int("TG_QPH", 20)   # в час
-    QPD = _env_int("TG_QPD", 100)  # в сутки
-
-    now = datetime.utcnow()
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT minute_count,hour_count,day_count,minute_ts,hour_ts,day_ts,cooldown_until FROM tg_rate WHERE id=1"
-            )
-            mc,hc,dc,mt,ht,dt,cool = c.fetchone()
-
-            # cooldown
-            if cool:
-                cu = datetime.fromisoformat(cool)
-                if now < cu:
-                    return False, int((cu - now).total_seconds())
-
-            # rolling windows
-            mt = datetime.fromisoformat(mt) if mt else now
-            ht = datetime.fromisoformat(ht) if ht else now
-            dt = datetime.fromisoformat(dt) if dt else now
-
-            if (now - mt) >= timedelta(minutes=1):
-                mc = 0; mt = now
-            if (now - ht) >= timedelta(hours=1):
-                hc = 0; ht = now
-            if (now - dt) >= timedelta(days=1):
-                dc = 0; dt = now
-
-            if mc >= QPM or hc >= QPH or dc >= QPD:
-                # мягкий отказ — ждать ближайшее окно
-                wait_min  = max(1, 60   - (now - mt).seconds)
-                wait_hour = max(1, 3600 - (now - ht).seconds)
-                wait_day  = max(1, 86400- (now - dt).seconds)
-                wait_sec = max(5, min(wait_min, wait_hour, wait_day))
-                return False, wait_sec
-
-            # резервируем «токен»
-            mc += 1; hc += 1; dc += 1
-            c.execute(
-                """UPDATE tg_rate 
-                   SET minute_count=?,hour_count=?,day_count=?,minute_ts=?,hour_ts=?,day_ts=?
-                   WHERE id=1""",
-                (mc,hc,dc,mt.isoformat(),ht.isoformat(),dt.isoformat()),
-            )
-            conn.commit()
-            return True, 0
-    except Exception as e:
-        logger.error(f"tg_rate_guard error: {e}")
-        return False, 30  # в сомнительных случаях — подождать
-
-def tg_rate_cooldown(seconds: int):
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            cu = (datetime.utcnow() + timedelta(seconds=seconds)).isoformat()
-            c.execute("UPDATE tg_rate SET cooldown_until=?", (cu,))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"tg_rate_cooldown error: {e}")
-
 def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
     """Собираем маленькие бусты по доменам на основе истории и фидбэка."""
     boosts: Dict[str, float] = {}
@@ -630,7 +480,7 @@ def is_relevant_url(url, prompt_phrases):
         return False
     u = (url or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
-    return "t.me" in u or "instagram.com" in u or any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
+    return any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
 
 GEO_HINTS: Dict[str, Dict[str, Any]] = {
     "kz-ru": {"tld": "kz", "tokens": ["Казахстан", "KZ", "Алматы", "Астана", "Astana", "Almaty"]},
@@ -710,8 +560,6 @@ def rank_result(description: str, prompt_phrases: List[str], url: str = None, re
     for p in prompt_phrases:
         if p.lower() in d:
             score += 0.4
-    if "t.me" in d or "instagram.com" in d:
-        score += 0.2
 
     if url:
         uu = url.lower()
@@ -867,14 +715,14 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
     return queries, queries
 
 # ========= Generate queries (wrapper) =========
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, List[str], Dict[str,bool]]:
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
     if region not in REGION_MAP:
         logging.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
 
     user_prompt = (user_prompt or "").strip()
     if not user_prompt:
-        return [user_prompt], [], region, [user_prompt], {
+        return [user_prompt], [], region, {
             "affiliate": False, "learn": False, "business": True, "casino": False
         }
 
@@ -886,8 +734,7 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         logging.warning(f"Gemini failed or invalid output: {e}. Falling back.")
         web_queries, phrases = fallback_expand_queries(user_prompt, region, intent)
 
-    telegram_queries = [user_prompt] + [p for p in phrases[:2] if p != user_prompt]
-    return web_queries, phrases, region, telegram_queries, intent
+    return web_queries, phrases, region, intent
 
 # ========= Build query with negative filters =========
 NEGATIVE_SITES_FOR_BUSINESS = [
@@ -983,161 +830,6 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]
     except Exception as e:
         logger.error(f"SerpAPI failed for '{q}': {e}")
         return []
-
-# ========= Telegram (client helper + endpoints + search) =========
-def _tg_proxy_tuple():
-    host = os.getenv("TELEGRAM_PROXY_HOST", "").strip()
-    port = int(os.getenv("TELEGRAM_PROXY_PORT", "0") or "0")
-    user = os.getenv("TELEGRAM_PROXY_USER", "").strip() or None
-    pwd = os.getenv("TELEGRAM_PROXY_PASS", "").strip() or None
-    if host and port and socks:
-        return (socks.SOCKS5, host, port, True, user, pwd)
-    if host and port and not socks:
-        logger.warning("TELEGRAM_PROXY_* set but PySocks is not installed; proxy ignored")
-    return None
-
-def get_tg_client():
-    if not TELEGRAM_ENABLED:
-        return None, "TELEGRAM_ENABLED is false"
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    if not (API_ID and API_HASH):
-        return None, "TELEGRAM_API_ID/TELEGRAM_API_HASH not set"
-
-    
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
-    proxy = _tg_proxy_tuple()
-
-    try:
-        if string_session:
-            client = TelegramClient(StringSession(string_session), API_ID, API_HASH, proxy=proxy)
-        else:
-            os.makedirs("data", exist_ok=True)
-            client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH, proxy=proxy)
-
-        client.connect()
-        return client, None
-    except Exception as e:
-        return None, f"Failed to init Telegram client: {e}"
-        
-        
-def telegram_search(queries, prompt_phrases, boosts: Dict[str,float]):
-    if not TELEGRAM_ENABLED:
-        logger.info("Telegram search disabled")
-        return []
-
-    results = []
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-
-    if not (API_ID and API_HASH and PHONE_NUMBER):
-        logger.error("Telegram env not fully configured; skipping")
-        return results
-
-    # Настройки «мягкости»
-    TG_SEARCH_TTL = _env_int("TG_SEARCH_TTL", 6 * 60 * 60)   # 6 часов кеш
-    BASE_SLEEP   = _env_float("TG_BASE_SLEEP", 3.0)          # базовая пауза между запросами
-    JITTER       = _env_float("TG_JITTER", 2.0)              # плюс-минус рандом
-    LIMIT_PER_QUERY = _env_int("TG_LIMIT_PER_QUERY", 5)      # не 10, чтобы мягче
-
-    client, err = get_tg_client()
-    if err:
-        logger.error(err)
-        return results
-
-    try:
-        # Не провоцируем лишнюю авторизацию через код
-        if not client.is_user_authorized():
-            logger.warning("Telegram: not authorized (no STRING_SESSION). Skipping Telegram search.")
-            client.disconnect()
-            return results
-
-        for q in queries:
-            q = (q or "").strip()
-            if not q:
-                continue
-
-            # 1) кеш
-            cached = tg_cache_get(q, TG_SEARCH_TTL)
-            if cached:
-                logger.info(f"Telegram cache hit for: {q}")
-                results.extend(cached)
-                time.sleep(BASE_SLEEP + random.uniform(0, JITTER))
-                continue
-
-            # 2) рейт-лимит
-            ok, wait_sec = tg_rate_guard()
-            if not ok:
-                logger.info(f"Telegram rate-guard: wait {wait_sec}s")
-                time.sleep(wait_sec)
-                # после ожидания — ещё раз пытаемся резервировать
-                ok2, wait_sec2 = tg_rate_guard()
-                if not ok2:
-                    logger.info(f"Telegram rate-guard(2): still wait {wait_sec2}s; skip this query")
-                    continue
-
-            logger.info(f"Searching Telegram for: {q}")
-            try:
-                result = client(SearchRequest(q=q, limit=LIMIT_PER_QUERY))
-                rows = []
-                for chat in result.chats:
-                    # Берём только публичные каналы/супергруппы с юзернеймом
-                    if getattr(chat, "username", None):
-                        name = chat.title or "N/A"
-                        username = f"t.me/{chat.username}"
-                        description = clean_description(getattr(chat, "description", ""))
-                        score = rank_result(description, prompt_phrases, url=username, boosts=boosts)
-
-                        # Доб. фильтр по релевантности
-                        if is_relevant_url(username, prompt_phrases) or score > 0.1:
-                            rows.append({
-                                "id": str(uuid.uuid4()),
-                                "name": name,
-                                "website": username,
-                                "description": description,
-                                "country": "N/A",
-                                "source": "Telegram",
-                                "score": score,
-                            })
-
-                # кешируем аккуратно именно rows по этому q
-                tg_cache_set(q, rows)
-                results.extend(rows)
-
-                # мягкая пауза между запросами
-                time.sleep(BASE_SLEEP + random.uniform(0, JITTER))
-
-            except FloodWaitError as e:
-                # Жёсткий сигнал от Telegram — ставим общий cooldown
-                cool = e.seconds + random.randint(5, 20)
-                logger.warning(f"Telegram FloodWait: {e.seconds}s -> cooldown {cool}s")
-                tg_rate_cooldown(cool)
-                time.sleep(min(cool, 60))  # тут не зависаем надолго, остальное «cooldown» отрежет
-            except Exception as e:
-                # Например 420 FROZEN_METHOD_INVALID — лучше не долбиться
-                msg = str(e).lower()
-                logger.error(f"Telegram search failed for '{q}': {e}")
-                if "frozen_method_invalid" in msg or "420" in msg:
-                    tg_rate_cooldown(_env_int("TG_FROZEN_COOLDOWN", 1800))  # 30 мин
-                    # не пытаемся дальше — уходим мягко
-                    break
-
-        client.disconnect()
-    except Exception as e:
-        logger.error(f"Telegram client failed: {e}")
-        try:
-            client.disconnect()
-        except:
-            pass
-    return results
 
 # ========= Scraper & filters =========
 def looks_like_definition_page(text: str, url: str, intent: Dict[str,bool]) -> bool:
@@ -1354,14 +1046,13 @@ def search():
         data = request.json or {}
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
-        use_telegram = bool(data.get("telegram", False)) and TELEGRAM_ENABLED
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
         max_results = int(data.get("max_results", 15))
 
         if not user_query:
             return jsonify({"error": "Query is required"}), 400
 
-        logger.info(f"API request: query='{user_query}', region={region}, telegram={use_telegram}, engine={engine}")
+        logger.info(f"API request: query='{user_query}', region={region}, engine={engine}")
 
         # Очистим текущую выдачу (без DROP, чтобы не гоняться с воркерами)
         with sqlite3.connect(DB_PATH) as conn:
@@ -1384,7 +1075,7 @@ def search():
             conn.commit()
 
         # Генерация подзапросов
-        web_queries, prompt_phrases, region, telegram_queries, intent = generate_search_queries(user_query, region)
+        web_queries, prompt_phrases, region, intent = generate_search_queries(user_query, region)
 
         # Запишем сам запрос в историю — вернётся query_id
         query_id = insert_query_record(user_query, intent, region)
@@ -1414,16 +1105,11 @@ def search():
         # Скрейп
         web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
 
-        # Телега (опционально)
-        telegram_results = telegram_search(telegram_queries, prompt_phrases, boosts) if use_telegram else []
-        all_results = web_results + telegram_results
-
         # Жёсткая финальная чистка
         filtered = []
-        for r in all_results:
+        for r in web_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
             dom = domain_of(r.get("website",""))
-            
             if is_bad_domain(dom):
                 continue
             if looks_like_sports_garbage(txt):
@@ -1444,7 +1130,6 @@ def search():
 
         return jsonify({
             "results": all_results,
-            "telegram_enabled": use_telegram,
             "region": region,
             "engine": engine
         })
@@ -1498,122 +1183,6 @@ def download_file(filetype):
 @app.route("/api/download/<filetype>", methods=["GET"])
 def api_download(filetype):
     return download_file(filetype)
-
-# ========= Telegram endpoints =========
-@app.route("/telegram/status", methods=["GET"])
-def tg_status():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"enabled": False, "authorized": False, "reason": "TELEGRAM_ENABLED is false"}), 200
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"enabled": True, "authorized": False, "error": err}), 200
-    try:
-        ok = client.is_user_authorized()
-        me = None
-        if ok:
-            me = client.get_me()
-            me = {"id": me.id, "username": getattr(me, "username", None), "phone": getattr(me, "phone", None)}
-        client.disconnect()
-        return jsonify({"enabled": True, "authorized": ok, "me": me}), 200
-    except Exception as e:
-        return jsonify({"enabled": True, "authorized": False, "error": str(e)}), 200
-
-@app.route("/telegram/send_code", methods=["POST"])
-def tg_send_code():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not PHONE_NUMBER:
-        return jsonify({"error": "TELEGRAM_PHONE not set"}), 400
-
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        force_sms = os.getenv("TELEGRAM_FORCE_SMS", "false").lower() == "true"
-        where = "sms" if force_sms else "telegram_app"
-        logger.info(f"Telegram: sending code to {where}")
-        client.send_code_request(PHONE_NUMBER, force_sms=force_sms)
-        client.disconnect()
-        return jsonify({"ok": True, "sent_to": where}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/confirm", methods=["POST"])
-def tg_confirm():
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    """
-    body = { "code": "12345", "password": "опц. 2FA" }
-    В ответ отдаём StringSession — положи в ENV TELEGRAM_STRING_SESSION.
-    """
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-    API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-    PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
-    if not (API_ID and API_HASH and PHONE_NUMBER):
-        return jsonify({"error": "TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_PHONE not set"}), 400
-
-    proxy = _tg_proxy_tuple()
-    client = TelegramClient(os.path.join("data", "tg_session"), API_ID, API_HASH, proxy=proxy)
-    try:
-        code = (request.json or {}).get("code", "").strip()
-        password = (request.json or {}).get("password")
-        if not code:
-            return jsonify({"error": "code is required"}), 400
-
-        client.connect()
-        if client.is_user_authorized():
-            s = StringSession.save(client.session)
-            me = client.get_me()
-            client.disconnect()
-            return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-
-        try:
-            client.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            if not password:
-                client.disconnect()
-                return jsonify({"ok": False, "error": "2FA enabled: password required"}), 400
-            client.sign_in(password=password)
-
-        s = StringSession.save(client.session)
-        me = client.get_me()
-        client.disconnect()
-        return jsonify({"ok": True, "string_session": s, "me": {"id": me.id, "username": getattr(me,"username",None)}}), 200
-    except Exception as e:
-        try:
-            client.disconnect()
-        except:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/telegram/logout", methods=["POST"])
-def tg_logout():
-    if not TELEGRAM_ENABLED:
-        return jsonify({"error": "TELEGRAM_ENABLED is false"}), 400
-    client, err = get_tg_client()
-    if err:
-        return jsonify({"error": err}), 500
-    try:
-        client.log_out()
-        client.disconnect()
-        try:
-            p = os.path.join("data", "tg_session.session")
-            if os.path.exists(p):
-                os.remove(p)
-        except:
-            pass
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        client.disconnect()
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ========= Serve SPA (frontend_dist) =========
 @app.route("/", defaults={"path": ""})
