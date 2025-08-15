@@ -1026,7 +1026,9 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
             if relax_level < 2 and not is_company_or_platform(url, text): continue
             if relax_level >= 2:
                 t = (text or "").lower()
-                if not (("affiliate" in t or "affiliat" in t or "партнерск" in t) and ("igaming" in t or "casino" in t or "казино" in t)):
+                aff = ("affiliate" in t or "affiliat" in t or "партнерск" in t or "опм" in t or "program management" in t)
+                ig = ("igaming" in t or "casino" in t or "казино" in t or "беттинг" in t or "sportsbook" in t or "slots" in t or "poker" in t)
+            if not (aff and ig):
                     continue
             if not passes_language(text): continue
             score = score_item(url, text, region, jitter_seed)
@@ -1220,6 +1222,68 @@ def save_to_db_and_files(web_results: List[Dict[str, Any]], intent: Dict[str, bo
         save_to_csv_txt()
     except Exception as e:
         logger.error(f"Export failed: {e}")
+        
+def backfill_minimum(results: List[Dict[str,Any]], user_query: str, region: str, need_min: int = MIN_RESULTS) -> List[Dict[str,Any]]:
+    """
+    Гарантирует минимум need_min элементов, не ломая формат ответа.
+    Сначала — seeds (affcatalog), потом — история (results_history).
+    """
+    out = list(results)
+    seen_domains = {domain_of(r["website"]) for r in out}
+
+    # 1) Seeds: можно добавить больше 5, если не хватает минимума
+    if len(out) < need_min:
+        need = min(need_min - len(out), 20)  # не захламляем
+        try:
+            seeds = harvest_affcatalog(user_query, region, limit=need)
+            for s in seeds:
+                d = domain_of(s["website"])
+                if d in seen_domains:
+                    continue
+                out.append(s)
+                seen_domains.add(d)
+                if len(out) >= need_min:
+                    break
+        except Exception as e:
+            logger.warning(f"Seed backfill failed: {e}")
+
+    # 2) History: без сети, берём свежие домены за 60 дней
+    if len(out) < need_min:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                since = (datetime.utcnow() - timedelta(days=60)).isoformat()
+                c.execute("""
+                    SELECT url, domain, MAX(score)
+                    FROM results_history
+                    WHERE created_at >= ?
+                    GROUP BY domain, url
+                    ORDER BY MAX(score) DESC
+                    LIMIT 200
+                """, (since,))
+                rows = c.fetchall() or []
+            for url, dom, s in rows:
+                if dom in seen_domains:
+                    continue
+                # минимально совместимый объект (без сетевых вызовов)
+                out.append({
+                    "id": str(uuid.uuid4()),
+                    "name": dom or "Candidate",
+                    "website": url,
+                    "description": "Previously validated candidate (history backfill).",
+                    "country": "N/A",
+                    "source": "History",
+                    "score": float(s or 0.4)
+                })
+                seen_domains.add(dom)
+                if len(out) >= need_min:
+                    break
+        except Exception as e:
+            logger.warning(f"History backfill failed: {e}")
+
+    # финальный срез и сортировка по score
+    out.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return out[:max(need_min, min(len(out), MAX_RESULTS))]
 
 # ======================= Floor & Blend =======================
 def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jitter_seed: int, deadline_ts: float) -> List[Dict[str,Any]]:
@@ -1288,6 +1352,10 @@ def search():
 
         # добиваем минимум 25, передаём общий дедлайн
         web_results = ensure_floor(web_results, urls, region, jitter_seed, deadline_ts=deadline_ts)
+        
+        # если после всех фаз меньше минимума — аварийная добивка (seeds + history)
+        if len(web_results) < MIN_RESULTS:
+        web_results = backfill_minimum(web_results, user_query, region, need_min=MIN_RESULTS)
 
         # аккуратно подмешиваем 2–5 из каталога (если есть место)
         mix_slots = max(0, min(5, MAX_RESULTS - len(web_results)))
