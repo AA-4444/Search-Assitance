@@ -10,6 +10,7 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
+from urllib.parse import urlparse, urljoin
 
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
@@ -957,7 +958,9 @@ AFF_RELEVANT_TOKENS_EN = [
     "casino","gambl","igaming","bet","sportsbook","slot","bookmak"
 ]
 AFF_LINK_TOKENS = [
-    "/ru/", "/offer", "/offers", "/program", "/programs", "/affiliate", "/aff", "/network", "/networks"
+    "/offer", "/offers", "/program", "/programs",
+    "/affiliate", "/aff", "/network", "/networks",
+    "/brands", "/catalog", "/list", "/directory", "/page/"
 ]
 
 def _aff_is_relevant_text(t: str) -> bool:
@@ -973,7 +976,7 @@ def _aff_is_relevant_href(href: str) -> bool:
     return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS + AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN)
 
 def _safe_get(url: str, timeout: float = 20.0, allow_proxy_retry: bool = True):
-    """Внутренний геттер с мягкими ретраями через прокси при 403/429/timeout."""
+    """Внутренний геттер с мягкими ретраями; 404 считаем нормальной ситуацией и просто пропускаем URL."""
     attempts = 0
     proxies_used = []
     while attempts <= MAX_PROXY_ATTEMPTS:
@@ -992,31 +995,38 @@ def _safe_get(url: str, timeout: float = 20.0, allow_proxy_retry: bool = True):
             return resp
         except Exception as e:
             se = str(e).lower()
-            if any(x in se for x in ["403","429","timeout","connection","ssl","remote disconnected"]):
+            # 404 — просто пропускаем без эскалации
+            if "404" in se:
+                logger.info(f"Affcatalog: 404 for {url}, skipping")
+                break
+            # Ошибки сети/лимитов — попробуем через прокси
+            if any(x in se for x in ["403", "429", "timeout", "connection", "ssl", "remote disconnected"]):
                 attempts += 1
                 if attempts > MAX_PROXY_ATTEMPTS:
                     logger.warning(f"Affcatalog: max proxy attempts for {url}")
                     break
                 time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
                 continue
-            logger.error(f"Affcatalog: fatal error for {url}: {e}")
+            # Прочие — предупреждение и выходим
+            logger.warning(f"Affcatalog: error for {url}: {e}")
             break
     return None
-
+    
 def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[str], region: str, query_id: str, already_urls: set) -> List[dict]:
     """
-    Пробегаемся по affcatalog.com/ru, находим карточки/страницы по казино/игеймингу,
-    собираем 4–6 вариантов и возвращаем в формате rows как в основном скрейпе.
+    Собираем 4–6 релевантных ссылок из affcatalog.com, корректно нормализуя URL и
+    при необходимости заглядывая на страницы категорий/пагинации.
     """
     if not (intent.get("affiliate") and intent.get("casino")):
         logger.info("Affcatalog: intent not affiliate+casino, skip")
         return []
 
+    # Сколько хотим (4–6 по умолчанию через переменные окружения)
     try:
         need_n = max(AFFCATALOG_MIN, 1)
         need_n = min(need_n + random.randint(0, max(AFFCATALOG_MAX - AFFCATALOG_MIN, 0)), AFFCATALOG_MAX)
     except Exception:
-        need_n = 5  # дефолт 4–6 → возьмём 5
+        need_n = 5
 
     base_url = AFFCATALOG_BASE.rstrip("/") + "/"
     resp = _safe_get(base_url)
@@ -1026,26 +1036,90 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
 
     soup = BeautifulSoup(resp.content, "html.parser")
 
-    # Собираем все потенциально релевантные ссылки внутри affcatalog
+    # Корень сайта (без /ru/)
+    parsed = urlparse(base_url)
+    site_root = f"{parsed.scheme}://{parsed.netloc}/"
+
+    # --- 1) Сбор с главной локализованной страницы ---
     candidates: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        text = a.get_text(" ").strip()
         if not href:
             continue
-        # Нормализуем относительные ссылки
-        if href.startswith("/"):
-            href = base_url.rstrip("/") + href
-        if "affcatalog.com" not in href:
+
+        # Нормализация URL: абсолютные, /relative к корню, относительные к base_url
+        if href.startswith("http://") or href.startswith("https://"):
+            full = href
+        elif href.startswith("/"):
+            full = urljoin(site_root, href)   # важно: к корню, чтобы не дублировать /ru/ru/
+        else:
+            full = urljoin(base_url, href)
+
+        # Подстраховка против повторяющихся /ru/
+        full = re.sub(r"(\/ru){2,}\/", "/ru/", full)
+
+        if "affcatalog.com" not in full:
             continue
-        # Фильтрация на предмет релевантности
-        if _aff_is_relevant_href(href) or _aff_is_relevant_text(text):
-            candidates.append(href)
 
-    # Дедупим и слегка перемешаем (чтобы не было всегда одних и тех же)
+        text = a.get_text(" ").strip()
+        if _aff_is_relevant_href(full) or _aff_is_relevant_text(text):
+            candidates.append(full)
+
     candidates = list(dict.fromkeys(candidates))
-    random.shuffle(candidates)
 
+    # --- 2) Если всё ещё мало — смотрим категории/пагинацию (до 2-го шага в глубину) ---
+    if len(candidates) < need_n:
+        category_like = []
+        for a in soup.find_all("a", href=True):
+            u = a["href"]
+            if not u:
+                continue
+
+            if u.startswith("http://") or u.startswith("https://"):
+                full = u
+            elif u.startswith("/"):
+                full = urljoin(site_root, u)
+            else:
+                full = urljoin(base_url, u)
+
+            full = re.sub(r"(\/ru){2,}\/", "/ru/", full)
+
+            if "affcatalog.com" in full and any(tok in full.lower() for tok in ["/program", "/offers", "/network", "/brands", "/catalog", "/list", "/directory", "/page/"]):
+                category_like.append(full)
+
+        category_like = list(dict.fromkeys(category_like))[:10]
+
+        for cat in category_like:
+            if len(candidates) >= need_n * 3:  # ограничение, чтобы не лазить бесконечно
+                break
+            sub = _safe_get(cat)
+            if not sub:
+                continue
+            s2 = BeautifulSoup(sub.content, "html.parser")
+            for a in s2.find_all("a", href=True):
+                u = a["href"]
+                if not u:
+                    continue
+
+                if u.startswith("http://") or u.startswith("https://"):
+                    full2 = u
+                elif u.startswith("/"):
+                    full2 = urljoin(site_root, u)
+                else:
+                    full2 = urljoin(cat, u)
+
+                full2 = re.sub(r"(\/ru){2,}\/", "/ru/", full2)
+
+                if "affcatalog.com" not in full2:
+                    continue
+
+                t = a.get_text(" ").strip()
+                if _aff_is_relevant_href(full2) or _aff_is_relevant_text(t):
+                    candidates.append(full2)
+
+        candidates = list(dict.fromkeys(candidates))
+
+    # --- 3) Сбор карточек и формирование rows ---
     rows: List[dict] = []
     seen_urls = set()
 
@@ -1054,23 +1128,23 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
             break
         if href in already_urls or href in seen_urls:
             continue
+
         sub = _safe_get(href)
         if not sub:
             continue
         s2 = BeautifulSoup(sub.content, "html.parser")
 
-        # Пытаемся прочитать заголовок/название карточки
+        # Название
         name = "N/A"
         title_el = s2.select_one("h1, .card-title, .title, .header-title, [class*='title']")
         if title_el:
             name = clean_description(getattr(title_el, "text", "") or title_el)
         else:
-            # запасной вариант — <title>
             ttag = s2.find("title")
             if ttag and ttag.text:
                 name = clean_description(ttag.text)
 
-        # Описание — meta description → первый параграф → общий фоллбек
+        # Описание
         description = "N/A"
         meta = s2.find("meta", attrs={"name": "description"})
         if meta and meta.get("content"):
@@ -1084,29 +1158,19 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
         if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description) or _aff_is_relevant_href(href)):
             continue
 
-        # Гео-инфо найти сложно — чаще всего это агрегатор, оставим "N/A"
-        country = "N/A"
-
-        # Выставим немного повышенный балл, чтобы карточки не потерялись в самом низу
-        base_score = 0.55
-        try:
-            base_score += 0.1 if any(p.lower() in (description or "").lower() for p in prompt_phrases[:3]) else 0.0
-        except Exception:
-            pass
-
         row = {
             "id": str(uuid.uuid4()),
             "name": name if name and name != "N/A" else "Affcatalog — партнёрская программа",
             "website": href,
             "description": description if description and description != "N/A" else "Партнёрская программа/каталог из Affcatalog (iGaming / casino / betting).",
-            "country": country,
+            "country": "N/A",
             "source": "Affcatalog",
-            "score": min(max(base_score, 0.0), 0.95),
+            "score":  min(0.65, 0.95),  # чуть повышаем, чтобы не терялись внизу
         }
         rows.append(row)
         seen_urls.add(href)
 
-    # Сохраним в БД/историю
+    # Сохранить в историю/БД
     for r in rows:
         save_result_records(r, intent, region, query_id)
 
