@@ -1073,7 +1073,7 @@ def feedback():
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"/feedback error: {e}")
-        return jsonify({"ok": False, "error": str(e)}"), 500
+         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
