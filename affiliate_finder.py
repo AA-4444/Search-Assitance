@@ -99,8 +99,8 @@ logger.addHandler(handler)
 # ========= Limits / pauses =========
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.8"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.4"))  # Уменьшили паузу для ускорения
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.8"))  # Уменьшили паузу для ускорения
 
 # ========= affcatalog config =========
 AFFCATALOG_BASE = os.getenv("AFFCATALOG_BASE", "https://affcatalog.com/ru/")
@@ -324,6 +324,9 @@ BAD_DOMAINS = {
     "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
     "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
+    # Добавлено для избежания карт и нерелевантных:
+    "maps.google.com", "google.com/maps", "yelp.com", "tripadvisor.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "linkedin.com", "pinterest.com", "tiktok.com"
 }
 def is_bad_domain(dom: str) -> bool:
     if not dom:
@@ -339,6 +342,9 @@ def is_bad_domain(dom: str) -> bool:
         d = d[4:]
     # точное совпадение с «плохими»
     if d in BAD_DOMAINS:
+        return True
+    # Дополнительно: если содержит maps или social
+    if "maps" in d or "social" in d or "forum" in d:
         return True
     return False
 
@@ -555,9 +561,9 @@ COMPANY_URL_TOKENS = [
     "management","consulting","company","about","contact","affiliates"
 ]
 
-def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None, boosts: Dict[str,float]=None) -> float:
+def rank_result(description: str, full_text: str, prompt_phrases: List[str], url: str = None, region: str = None, boosts: Dict[str,float]=None) -> float:
     score = 0.0
-    d = (description or "").lower()
+    d = (description or "").lower() + " " + (full_text or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     for w in words:
         if w in d:
@@ -582,9 +588,9 @@ def rank_result(description: str, prompt_phrases: List[str], url: str = None, re
         score += geo_score_boost(url, d, region)
     return min(max(score, 0.0), 1.0)
 
-def analyze_result(description, prompt_phrases):
+def analyze_result(description: str, full_text: str, prompt_phrases: List[str]):
     specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
-    cleaned = clean_description(description).lower()
+    cleaned = clean_description(description + " " + full_text).lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     if classifier is None:
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
@@ -611,7 +617,7 @@ def _extract_json_array_maybe(text: str) -> List[str]:
             return val
     except Exception:
         pass
-    m = re.search(r"$begin:math:display$[\\s\\S]*$end:math:display$", text)
+    m = re.search(r"\[[\s\S]*\]", text)  # Улучшили парсинг JSON массива
     if m:
         try:
             val = json.loads(m.group(0))
@@ -638,7 +644,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
     cache_key = f"gemini:{region}:{json.dumps(intent, sort_keys=True, ensure_ascii=False)}:{user_prompt}".strip()
     cached = cache_get(cache_key, max_age_hours=12)
     if cached:
-        return cached[:12], cached[:12]
+        return cached[:8], cached[:8]  # Уменьшили до 8 для ускорения
 
     body = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
@@ -673,7 +679,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
         if arr:
             cache_set(cache_key, arr)
             logger.info(f"Using Gemini for query expansion ({len(arr)} variants)")
-            return arr[:12], arr[:12]
+            return arr[:8], arr[:8]  # Уменьшили до 8 для ускорения
 
     raise RuntimeError("Gemini returned invalid JSON")
 
@@ -715,7 +721,7 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
         ]
         queries = maybe_add_ru_site_dupes(queries)
 
-    queries = list(dict.fromkeys([q for q in queries if q]))[:20]
+    queries = list(dict.fromkeys([q for q in queries if q]))[:10]  # Уменьшили до 10 для ускорения
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, casino={intent.get('casino')}), produced {len(queries)} queries")
     return queries, queries
 
@@ -789,7 +795,7 @@ def looks_like_blog(url: str, text: str) -> bool:
     return any(tok in t for tok in BLOG_TEXT_TOKENS_RU) or any(tok in t for tok in BLOG_TEXT_TOKENS_EN)
 
 # ========= Search engines (DDG / SerpAPI) =========
-def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):
+def duckduckgo_search(query, max_results=10, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):  # Уменьшили max_results до 10
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
@@ -813,7 +819,7 @@ def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bo
         logger.error(f"DDG failed for '{q}': {e}")
         return []
 
-def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
+def serpapi_search(query, max_results=10, region="wt-wt", intent: Dict[str,bool]=None):  # Уменьшили max_results до 10
     if not SERPAPI_API_KEY:
         logger.info("SERPAPI_API_KEY is not set; skipping SerpAPI")
         return []
@@ -857,7 +863,7 @@ def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
 def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
-    urls = list(dict.fromkeys(urls))[:80]
+    urls = list(dict.fromkeys(urls))[:40]  # Ограничили до 40 URL для ускорения
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
         if is_bad_domain(domain_of(url)):
@@ -877,7 +883,7 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
             try:
                 headers = {"User-Agent": os.getenv("SCRAPER_UA",
                           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")}
-                resp = requests.get(url, headers=headers, timeout=20, proxies=proxy)
+                resp = requests.get(url, headers=headers, timeout=10, proxies=proxy)  # Уменьшили timeout
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.content, "html.parser")
 
@@ -898,33 +904,44 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                         if len(description) > 10:
                             break
 
+                # Добавлено: извлечение полного текста для глубокого анализа
+                full_text = " ".join([p.get_text(strip=True) for p in soup.find_all('p')])[:3000]  # До 3000 символов для скорости
+
                 country = "N/A"
                 el = soup.select_one(".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info")
                 if el:
                     country = clean_description(el.text)
 
-                if looks_like_sports_garbage(description):
+                if looks_like_sports_garbage(description + full_text):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
-                if looks_like_definition_page(description, url, intent):
+                if looks_like_definition_page(description + full_text, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
-                if should_cut_blog(url, description, intent):
+                if should_cut_blog(url, description + full_text, intent):
                     logger.info(f"Skip blog/guide page in affiliate+casino case: {url}")
                     success = True
                     break
 
-                score = rank_result(description, prompt_phrases, url=url, region=region, boosts=boosts)
+                is_rel, specialization, status, suitability = analyze_result(description, full_text, prompt_phrases)
+                if not is_rel:
+                    logger.info(f"Skip non-relevant by deep analysis: {url}")
+                    continue
+
+                score = rank_result(description, full_text, prompt_phrases, url=url, region=region, boosts=boosts)
                 if is_relevant_url(url, prompt_phrases) or score > 0.1:
                     row = {
                         "id": str(uuid.uuid4()),
                         "name": name,
                         "website": url,
                         "description": description,
+                        "specialization": specialization,
                         "country": country,
                         "source": "Web",
+                        "status": status,
+                        "suitability": suitability,
                         "score": score,
                     }
                     results.append(row)
@@ -972,7 +989,7 @@ def _aff_is_relevant_href(href: str) -> bool:
     h = href.lower()
     return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS + AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN)
 
-def _safe_get(url: str, timeout: float = 20.0, allow_proxy_retry: bool = True):
+def _safe_get(url: str, timeout: float = 10.0, allow_proxy_retry: bool = True):  # Уменьшили timeout
     """Внутренний геттер с мягкими ретраями через прокси при 403/429/timeout."""
     attempts = 0
     proxies_used = []
@@ -1080,27 +1097,34 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
             if p:
                 description = clean_description(p.get_text(" "))
 
+        # Добавлено: полный текст для анализа
+        full_text = " ".join([p.get_text(strip=True) for p in s2.find_all('p')])[:3000]
+
         # Жёсткая релевантность к казино/игеймингу
-        if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description) or _aff_is_relevant_href(href)):
+        if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description + full_text) or _aff_is_relevant_href(href)):
             continue
 
         # Гео-инфо найти сложно — чаще всего это агрегатор, оставим "N/A"
         country = "N/A"
 
+        is_rel, specialization, status, suitability = analyze_result(description, full_text, prompt_phrases)
+        if not is_rel:
+            continue
+
         # Выставим немного повышенный балл, чтобы карточки не потерялись в самом низу
-        base_score = 0.55
-        try:
-            base_score += 0.1 if any(p.lower() in (description or "").lower() for p in prompt_phrases[:3]) else 0.0
-        except Exception:
-            pass
+        base_score = rank_result(description, full_text, prompt_phrases, url=href, region=region)
+        base_score = max(base_score, 0.55)
 
         row = {
             "id": str(uuid.uuid4()),
             "name": name if name and name != "N/A" else "Affcatalog — партнёрская программа",
             "website": href,
             "description": description if description and description != "N/A" else "Партнёрская программа/каталог из Affcatalog (iGaming / casino / betting).",
+            "specialization": specialization,
             "country": country,
             "source": "Affcatalog",
+            "status": status,
+            "suitability": suitability,
             "score": min(max(base_score, 0.0), 0.95),
         }
         rows.append(row)
@@ -1126,8 +1150,8 @@ def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str,
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     row["id"], row.get("name","N/A"), row["website"], row.get("description","N/A"),
-                    ", ".join([]).title(), row.get("country","N/A"), row.get("source","Web"),
-                    "Active", "Подходит", row.get("score",0.0),
+                    row.get("specialization", ", ".join([]).title()), row.get("country","N/A"), row.get("source","Web"),
+                    row.get("status", "Active"), row.get("suitability", "Подходит"), row.get("score",0.0),
                 ),
             )
             # В историю
@@ -1216,7 +1240,7 @@ def search():
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
-        max_results = int(data.get("max_results", 15))
+        max_results = int(data.get("max_results", 10))  # Уменьшили дефолт
 
         if not user_query:
             return jsonify({"error": "Query is required"}), 400
