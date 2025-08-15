@@ -37,8 +37,8 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY", "").strip() or None
 
 MIN_RESULTS = int(os.getenv("MIN_RESULTS", "25"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "3"))
 STRONG_BLOCK_ON_BAD = (os.getenv("STRONG_BLOCK_ON_BAD", "true").lower() == "true")
 
@@ -58,11 +58,14 @@ SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 ми�
 _last_serpapi_429_at = 0.0
 
 # Жёсткий дедлайн на скрапинг (ускоряет ответ)
-SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "120"))  # 2 минуты
+SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "180"))  # 3 минуты
 
-# Микрокраул — максимально бережный
+# Начальный потолок на число URL для скрапинга
+INITIAL_SCRAPE_CAP = int(os.getenv("INITIAL_SCRAPE_CAP", "140"))
+
+# Микрокраул — максимально бережный (по умолчанию выключен для скорости)
 MAX_MICROCRAWL_PAGES = int(os.getenv("MAX_MICROCRAWL_PAGES", "1"))
-ENABLE_MICROCRAWL = (os.getenv("ENABLE_MICROCRAWL", "true").lower() == "true")
+ENABLE_MICROCRAWL = (os.getenv("ENABLE_MICROCRAWL", "false").lower() == "true")
 
 # ======================= Logging =======================
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
@@ -116,6 +119,11 @@ CURRENCY_HINTS = {
     "by-ru": (("Br","BYN","руб"), 0.2),
 }
 ACCEPT_LANG_POOL = ["en,ru,uk;q=0.9", "ru,en;q=0.9", "en;q=0.8"]
+
+NEGATIVE_PROVIDER_HINTS = (
+    "white label","turnkey","game aggregator","casino provider","turnkey solution","white-label",
+    "sportsbook solution","casino platform","game aggregation","slots provider","studio"
+)
 
 def clean_text(s: str) -> str:
     if not s: return ""
@@ -345,7 +353,8 @@ COMPANY_SERVICE_HINTS = (
     "our services","services","solutions","platform","for operators","for brands","for advertisers",
     "clients","case study","case studies","features","integrations","pricing",
     "request a demo","get a demo","contact sales","schedule a call","request proposal",
-    "program management","affiliate management","opm","outsourced program management"
+    "program management","affiliate management","opm","outsourced program management",
+    "partner acquisition","performance marketing","acquisition marketing"
 )
 
 # ======================= Utility filters =======================
@@ -539,6 +548,15 @@ def domain_feedback_adjustment(domain: str) -> float:
     except Exception:
         return 0.0
 
+# ======================= HTTP Session (faster) =======================
+SESSION = requests.Session()
+try:
+    adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
+    SESSION.mount("http://", adapter)
+    SESSION.mount("https://", adapter)
+except Exception:
+    pass
+
 # ======================= Search engines =======================
 def duckduckgo_search(query, max_results=25, region="wt-wt"):
     if not _engine_allowed("ddg"):
@@ -579,7 +597,7 @@ def serpapi_search(query, max_results=25, region="wt-wt"):
         "google_domain": reg["google_domain"],
     }
     try:
-        r = requests.get("https://serpapi.com/search.json", params=params, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://serpapi.com/search.json", params=params, timeout=(3.5, REQUEST_TIMEOUT))
         r.raise_for_status()
         data = r.json()
         urls = [it.get("link") for it in data.get("organic_results", []) if it.get("link")]
@@ -604,11 +622,11 @@ def serpapi_search(query, max_results=25, region="wt-wt"):
 
 # ======================= Scraping & Deep analysis =======================
 def _request_headers():
-    return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL)}
+    return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL), "Accept-Encoding": "gzip, deflate, br"}
 
 def _http_get(url: str) -> Optional[requests.Response]:
     try:
-        resp = requests.get(url, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
+        resp = SESSION.get(url, headers=_request_headers(), timeout=(3.5, REQUEST_TIMEOUT), allow_redirects=True)
         if resp.status_code >= 400: return None
         ct = (resp.headers.get("Content-Type","") or "").lower()
         if "text/html" not in ct and "application/xhtml" not in ct: return None
@@ -676,11 +694,13 @@ def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
         if not text: return None
 
         t_low = text.lower()
-        # быстрая отбраковка сетей "для вебмастеров"
-        if any(h in t_low for h in NETWORK_FOR_PUBLISHERS_HINTS):
+        # быстрые анти-сигналы
+        if any(h in t_low for h in NETWORK_FOR_PUBLISHERS_HINTS):  # сеть для вебмастеров
+            return None
+        if any(h in t_low for h in NEGATIVE_PROVIDER_HINTS):  # провайдеры/аггрегаторы/white-label
             return None
 
-        # микрокраул — строго при необходимости (регион слабый или мало company-сигналов)
+        # микрокраул — строго при необходимости
         need_more_region = region_affinity_quick(url, t_low, region) < 0.6
         need_company = not is_company_or_platform(url, t_low)
         extras_text = ""
@@ -697,8 +717,6 @@ def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
         return None
 
 # ======================= Classification & Scoring =======================
-CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
-
 def is_operator_program(url: str, text: str) -> bool:
     u = url.lower(); t = text.lower()
     if any(tok in u for tok in CASINO_TLDS): return True
@@ -715,15 +733,13 @@ def is_network_for_publishers(text: str) -> bool:
 
 def is_company_or_platform(url: str, text: str) -> bool:
     t = text.lower()
-    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced","program management","affiliate management"))
-    has_ig  = any(k in t for k in ("igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker","poker","slots"))
+    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced","program management","affiliate management","partner acquisition","performance marketing"))
+    has_ig  = any(k in t for k in ("igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker","poker","slots","gambling"))
     if not (has_aff and has_ig): return False
     has_company = any(k in t for k in COMPANY_SERVICE_HINTS)
     if not has_company: return False
     if is_network_for_publishers(t): return False
     return True
-
-
 
 def classify(url: str, text: str) -> str:
     if looks_like_job(url, text): return "jobs"
@@ -786,7 +802,7 @@ def region_affinity(url: str, text: str, region: str) -> float:
 
 def base_relevance(text: str) -> float:
     t = text.lower(); rel = 0.0
-    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced","program management","affiliate management")): rel += 0.45
+    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced","program management","affiliate management","partner acquisition","performance marketing")): rel += 0.45
     if any(k in t for k in ("igaming","casino","беттинг","sportsbook","bookmaker","poker","slots","gambling")): rel += 0.4
     if any(k in t for k in ("for operators","for brands","for advertisers","clients","case study","platform","services","solutions")): rel += 0.25
     return max(0.0, min(1.0, rel))
@@ -912,6 +928,9 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
         per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
         filtered_urls.append(u)
 
+    # ограничение на стартовый объём
+    filtered_urls = filtered_urls[:INITIAL_SCRAPE_CAP]
+
     reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
     tld = "." + reg["tld"] if reg.get("tld") else ""
 
@@ -920,7 +939,8 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fut2url = {ex.submit(fetch_one, u, region): u for u in filtered_urls}
         for fut in as_completed(fut2url):
-            if (time.time() - start_ts) > SCRAPE_HARD_DEADLINE_SEC:
+            now = time.time()
+            if (now - start_ts) > SCRAPE_HARD_DEADLINE_SEC:
                 logger.warning("Scrape deadline reached, stopping further processing")
                 break
             item = fut.result()
@@ -933,6 +953,10 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
             if classify(url, text) != "company_or_platform": continue
             if not language_ok(text, region): continue
 
+            # для регионов, отличных от wt-wt, требуем базовую региональность
+            if region != "wt-wt" and region_affinity_quick(url, text.lower(), region) < 0.4:
+                continue
+
             score = score_item(url, text, region)
             results.append({
                 "id": str(uuid.uuid4()),
@@ -943,6 +967,10 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
                 "source": "Web",
                 "score": score
             })
+
+            # как только собрали минимум — можем прекращать, чтобы отдать быстрее
+            if len(results) >= MIN_RESULTS and (now - start_ts) > 15:
+                break
 
     # Дедуп по домену: 1 (редко 2) записи
     by_domain: Dict[str, List[Dict[str,Any]]] = {}
@@ -975,17 +1003,25 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
 def escalate_if_needed(results: List[Dict[str,Any]], urls: List[str], region: str, engine: str, per_query_k: int, user_prompt: str) -> List[Dict[str,Any]]:
     if len(results) >= MIN_RESULTS:
         return results
-    # Мягкая эскалация: новые запросы без site:.tld, но с country tokens
-    geo_queries_soft = apply_geo_bias(build_core_queries(user_prompt), region)
-    geo_queries_soft = [q for i,q in enumerate(geo_queries_soft) if i not in (1,2)]
-    more_urls = collect_urls([with_intent_filters(q, detect_intent(user_prompt)) for q in geo_queries_soft], region, engine, per_query_k)
+    # Мягкая эскалация: таргетированные запросы на агентства/OPM (без blog/news)
+    extra_queries = [
+        "igaming affiliate agency for operators",
+        "casino affiliate program management agency",
+        "igaming opm agency",
+        "casino affiliate management services",
+        "управление партнерской программой казино агентство",
+    ]
+    extra_queries = [with_intent_filters(q, detect_intent(user_prompt)) for q in extra_queries]
+    more_urls = collect_urls(extra_queries, region, engine, per_query_k)
     merged = list(dict.fromkeys(urls + more_urls))
-    more = scrape_parallel(merged[len(urls):len(urls)+600], region)
+    more = scrape_parallel(merged[len(urls):len(urls)+400], region)
 
     known = set(r["website"] for r in results)
     for r in more:
         if r["website"] not in known:
             results.append(r); known.add(r["website"])
+            if len(results) >= MAX_RESULTS:
+                break
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:MAX_RESULTS]
 
@@ -1024,7 +1060,7 @@ def search():
         logger.info(f"Pre-filtered URLs (unique & not blocked): {len(urls)}")
 
         t0 = time.time()
-        web_results = scrape_parallel(urls[:400], region)
+        web_results = scrape_parallel(urls, region)
 
         if len(web_results) < MIN_RESULTS:
             web_results = escalate_if_needed(web_results, urls, region, engine, per_query_k, user_query)
