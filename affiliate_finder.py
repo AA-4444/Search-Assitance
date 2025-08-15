@@ -99,13 +99,13 @@ logger.addHandler(handler)
 # ========= Limits / pauses =========
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.2"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.4"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.8"))
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 
 # ========= affcatalog config =========
 AFFCATALOG_BASE = os.getenv("AFFCATALOG_BASE", "https://affcatalog.com/ru/")
-AFFCATALOG_MIN = int(os.getenv("AFFCATALOG_MIN", "8"))
-AFFCATALOG_MAX = int(os.getenv("AFFCATALOG_MAX", "12"))
+AFFCATALOG_MIN = int(os.getenv("AFFCATALOG_MIN", "4"))
+AFFCATALOG_MAX = int(os.getenv("AFFCATALOG_MAX", "6"))
 
 # ========= Search engines & helpers =========
 from ddgs import DDGS
@@ -257,6 +257,7 @@ def init_db():
     except sqlite3.Error as e:
         logger.error(f"Failed to initialize database: {e}")
 
+# ВАЖНО: под gunicorn блок __main__ не срабатывает — инициируем БД при импорте
 init_db()
 
 # ========= Utility: counters & proxies =========
@@ -323,8 +324,6 @@ BAD_DOMAINS = {
     "linguee.com","bab.la","reverso.net","sinonim.org","wordhippo.com","microsoft.com",
     "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
-    "maps.google.com", "google.com/maps", "yelp.com", "tripadvisor.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
-    "linkedin.com", "pinterest.com", "tiktok.com", "gorodrabot.ru", "payment-provider.com"
 }
 def is_bad_domain(dom: str) -> bool:
     if not dom:
@@ -354,17 +353,6 @@ SPORTS_TRASH_TOKENS = {
     "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
 }
 
-NON_AFFILIATE_TOKENS = {
-    "вакансии", "работа", "job", "vacancy", "employment", "платежные", "payment provider",
-    "recruitment", "career", "hiring"
-}
-
-def looks_like_non_affiliate(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(tok in t for tok in NON_AFFILIATE_TOKENS)
-
 def looks_like_sports_garbage(text: str) -> bool:
     if not text:
         return False
@@ -381,7 +369,7 @@ INTENT_LEARN = {
     "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to"
 }
 CASINO_TOKENS = {
-    "казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","ставки","bookmaker","sportsbook","slots"
+    "казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","ставки","bookmaker","sportsbook"
 }
 
 def detect_intent(q: str) -> Dict[str, bool]:
@@ -458,10 +446,12 @@ def cache_set(key: str, data: Any):
         logger.error(f"Failed to write cache: {e}")
 
 def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
+    """Собираем маленькие бусты по доменам на основе истории и фидбэка."""
     boosts: Dict[str, float] = {}
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
+            # Частота появления доменов в похожих intent’ах
             c.execute("""
                 SELECT domain, COUNT(*) as cnt
                 FROM results_history
@@ -472,6 +462,7 @@ def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
             for domain, cnt in c.fetchall():
                 boosts[domain] = boosts.get(domain, 0.0) + min(0.05 * (1 + (cnt ** 0.5)), 0.2)
 
+            # Полож./отриц. фидбэк
             c.execute("""
                 SELECT domain,
                        SUM(CASE WHEN action='good' THEN weight WHEN action='click' THEN weight*0.5 ELSE 0 END) as pos,
@@ -564,36 +555,36 @@ COMPANY_URL_TOKENS = [
     "management","consulting","company","about","contact","affiliates"
 ]
 
-def rank_result(description: str, full_text: str, prompt_phrases: List[str], url: str = None, region: str = None, boosts: Dict[str,float]=None) -> float:
+def rank_result(description: str, prompt_phrases: List[str], url: str = None, region: str = None, boosts: Dict[str,float]=None) -> float:
     score = 0.0
-    d = (description or "").lower() + " " + (full_text or "").lower()
+    d = (description or "").lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     for w in words:
         if w in d:
-            score += 0.2 if len(w) > 6 else 0.1
+            score += 0.3 if len(w) > 6 else 0.2
     for p in prompt_phrases:
         if p.lower() in d:
-            score += 0.3
+            score += 0.4
 
     if url:
         uu = url.lower()
         if any(tok in uu for tok in COMPANY_URL_TOKENS):
-            score += 0.2
+            score += 0.3
         if boosts:
             score += boosts.get(domain_of(url), 0.0)
 
     if url and looks_like_blog(url, d):
-        score = max(score - 0.3, 0.0)
+        score = max(score - 0.4, 0.0)
 
     if looks_like_sports_garbage(d):
-        score = min(score, 0.1)
+        score = min(score, 0.2)
     if url and region:
         score += geo_score_boost(url, d, region)
     return min(max(score, 0.0), 1.0)
 
-def analyze_result(description: str, full_text: str, prompt_phrases: List[str]):
+def analyze_result(description, prompt_phrases):
     specialization = ", ".join(prompt_phrases[:2]).title() if prompt_phrases else "General"
-    cleaned = clean_description(description + " " + full_text).lower()
+    cleaned = clean_description(description).lower()
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     if classifier is None:
         status = "Active" if any(w in cleaned for w in words) else "Unknown"
@@ -620,7 +611,7 @@ def _extract_json_array_maybe(text: str) -> List[str]:
             return val
     except Exception:
         pass
-    m = re.search(r"\[[\s\S]*\]", text)
+    m = re.search(r"$begin:math:display$[\\s\\S]*$end:math:display$", text)
     if m:
         try:
             val = json.loads(m.group(0))
@@ -643,6 +634,7 @@ def gemini_expand_queries(user_prompt: str, region: str, intent: Dict[str, bool]
     guard = "AFFILIATE=YES" if intent.get("affiliate") else "AFFILIATE=NO"
     user_text = f"{guard}\nЗапрос: {user_prompt}\nРегион: {region}\nФормат ответа: JSON массив строк."
 
+    # cache
     cache_key = f"gemini:{region}:{json.dumps(intent, sort_keys=True, ensure_ascii=False)}:{user_prompt}".strip()
     cached = cache_get(cache_key, max_age_hours=12)
     if cached:
@@ -797,7 +789,7 @@ def looks_like_blog(url: str, text: str) -> bool:
     return any(tok in t for tok in BLOG_TEXT_TOKENS_RU) or any(tok in t for tok in BLOG_TEXT_TOKENS_EN)
 
 # ========= Search engines (DDG / SerpAPI) =========
-def duckduckgo_search(query, max_results=25, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):
+def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
@@ -821,7 +813,7 @@ def duckduckgo_search(query, max_results=25, region="wt-wt", intent: Dict[str,bo
         logger.error(f"DDG failed for '{q}': {e}")
         return []
 
-def serpapi_search(query, max_results=25, region="wt-wt", intent: Dict[str,bool]=None):
+def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
     if not SERPAPI_API_KEY:
         logger.info("SERPAPI_API_KEY is not set; skipping SerpAPI")
         return []
@@ -862,11 +854,10 @@ def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
         return looks_like_blog(url, text)
     return False
 
-def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str, user_urls: List[str]=None):
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
-    urls = (user_urls or []) + urls
-    urls = list(dict.fromkeys(urls))[:60]
+    urls = list(dict.fromkeys(urls))[:80]
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
         if is_bad_domain(domain_of(url)):
@@ -886,7 +877,7 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
             try:
                 headers = {"User-Agent": os.getenv("SCRAPER_UA",
                           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")}
-                resp = requests.get(url, headers=headers, timeout=10, proxies=proxy)
+                resp = requests.get(url, headers=headers, timeout=20, proxies=proxy)
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.content, "html.parser")
 
@@ -907,54 +898,33 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                         if len(description) > 10:
                             break
 
-                full_text = " ".join([p.get_text(strip=True) for p in soup.find_all('p')])[:3000]
-
-                country = "Global"
+                country = "N/A"
                 el = soup.select_one(".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info")
                 if el:
-                    country_text = clean_description(el.text).lower()
-                    known_countries = ["usa", "russia", "uk", "germany", "france", "ukraine", "canada", "malta", "cyprus", "sweden", "japan"]
-                    for kc in known_countries:
-                        if kc in country_text:
-                            country = kc.title()
-                            break
+                    country = clean_description(el.text)
 
-                if looks_like_sports_garbage(description + full_text):
+                if looks_like_sports_garbage(description):
                     logger.info(f"Skip sports-like garbage: {url}")
                     success = True
                     break
-                if looks_like_non_affiliate(description + full_text):
-                    logger.info(f"Skip non-affiliate content: {url}")
-                    success = True
-                    break
-                if looks_like_definition_page(description + full_text, url, intent):
+                if looks_like_definition_page(description, url, intent):
                     logger.info(f"Skip knowledge page by intent: {url}")
                     success = True
                     break
-                if should_cut_blog(url, description + full_text, intent):
+                if should_cut_blog(url, description, intent):
                     logger.info(f"Skip blog/guide page in affiliate+casino case: {url}")
                     success = True
                     break
 
-                is_rel, specialization, status, suitability = analyze_result(description, full_text, prompt_phrases)
-                if not is_rel:
-                    logger.info(f"Skip non-relevant by deep analysis: {url}")
-                    continue
-
-                score = rank_result(description, full_text, prompt_phrases, url=url, region=region, boosts=boosts)
-                if url in (user_urls or []):
-                    score = min(score + 0.2, 1.0)
-                if is_relevant_url(url, prompt_phrases) or score > 0.05:
+                score = rank_result(description, prompt_phrases, url=url, region=region, boosts=boosts)
+                if is_relevant_url(url, prompt_phrases) or score > 0.1:
                     row = {
                         "id": str(uuid.uuid4()),
                         "name": name,
                         "website": url,
                         "description": description,
-                        "specialization": specialization,
                         "country": country,
                         "source": "Web",
-                        "status": status,
-                        "suitability": suitability,
                         "score": score,
                     }
                     results.append(row)
@@ -994,15 +964,16 @@ def _aff_is_relevant_text(t: str) -> bool:
     if not t:
         return False
     tl = t.lower()
-    return any(tok in tl for tok in AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN + ["affiliate", "partner", "program"])
+    return any(tok in tl for tok in AFF_RELEVANT_TOKENS_RU) or any(tok in tl for tok in AFF_RELEVANT_TOKENS_EN)
 
 def _aff_is_relevant_href(href: str) -> bool:
     if not href:
         return False
     h = href.lower()
-    return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS)
+    return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS + AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN)
 
-def _safe_get(url: str, timeout: float = 10.0, allow_proxy_retry: bool = True):
+def _safe_get(url: str, timeout: float = 20.0, allow_proxy_retry: bool = True):
+    """Внутренний геттер с мягкими ретраями через прокси при 403/429/timeout."""
     attempts = 0
     proxies_used = []
     while attempts <= MAX_PROXY_ATTEMPTS:
@@ -1033,6 +1004,10 @@ def _safe_get(url: str, timeout: float = 10.0, allow_proxy_retry: bool = True):
     return None
 
 def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[str], region: str, query_id: str, already_urls: set) -> List[dict]:
+    """
+    Пробегаемся по affcatalog.com/ru, находим карточки/страницы по казино/игеймингу,
+    собираем 4–6 вариантов и возвращаем в формате rows как в основном скрейпе.
+    """
     if not (intent.get("affiliate") and intent.get("casino")):
         logger.info("Affcatalog: intent not affiliate+casino, skip")
         return []
@@ -1041,7 +1016,7 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
         need_n = max(AFFCATALOG_MIN, 1)
         need_n = min(need_n + random.randint(0, max(AFFCATALOG_MAX - AFFCATALOG_MIN, 0)), AFFCATALOG_MAX)
     except Exception:
-        need_n = 5
+        need_n = 5  # дефолт 4–6 → возьмём 5
 
     base_url = AFFCATALOG_BASE.rstrip("/") + "/"
     resp = _safe_get(base_url)
@@ -1051,30 +1026,24 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
 
     soup = BeautifulSoup(resp.content, "html.parser")
 
+    # Собираем все потенциально релевантные ссылки внутри affcatalog
     candidates: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         text = a.get_text(" ").strip()
         if not href:
             continue
+        # Нормализуем относительные ссылки
         if href.startswith("/"):
             href = base_url.rstrip("/") + href
         if "affcatalog.com" not in href:
             continue
-        candidates.append(href)
-    
-    for href in candidates[:50]:
-        sub_resp = _safe_get(href)
-        if sub_resp:
-            sub_soup = BeautifulSoup(sub_resp.content, "html.parser")
-            for sub_a in sub_soup.find_all("a", href=True):
-                sub_href = sub_a["href"]
-                if sub_href.startswith("/"):
-                    sub_href = base_url.rstrip("/") + sub_href
-                if "affcatalog.com" in sub_href and sub_href not in candidates:
-                    candidates.append(sub_href)
+        # Фильтрация на предмет релевантности
+        if _aff_is_relevant_href(href) or _aff_is_relevant_text(text):
+            candidates.append(href)
 
-    candidates = list(dict.fromkeys(candidates))[:100]
+    # Дедупим и слегка перемешаем (чтобы не было всегда одних и тех же)
+    candidates = list(dict.fromkeys(candidates))
     random.shuffle(candidates)
 
     rows: List[dict] = []
@@ -1090,15 +1059,18 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
             continue
         s2 = BeautifulSoup(sub.content, "html.parser")
 
+        # Пытаемся прочитать заголовок/название карточки
         name = "N/A"
         title_el = s2.select_one("h1, .card-title, .title, .header-title, [class*='title']")
         if title_el:
             name = clean_description(getattr(title_el, "text", "") or title_el)
         else:
+            # запасной вариант — <title>
             ttag = s2.find("title")
             if ttag and ttag.text:
                 name = clean_description(ttag.text)
 
+        # Описание — meta description → первый параграф → общий фоллбек
         description = "N/A"
         meta = s2.find("meta", attrs={"name": "description"})
         if meta and meta.get("content"):
@@ -1108,34 +1080,33 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
             if p:
                 description = clean_description(p.get_text(" "))
 
-        full_text = " ".join([p.get_text(strip=True) for p in s2.find_all('p')])[:3000]
-
-        if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description + full_text) or _aff_is_relevant_href(href)):
+        # Жёсткая релевантность к казино/игеймингу
+        if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description) or _aff_is_relevant_href(href)):
             continue
 
-        country = "Global"
+        # Гео-инфо найти сложно — чаще всего это агрегатор, оставим "N/A"
+        country = "N/A"
 
-        is_rel, specialization, status, suitability = analyze_result(description, full_text, prompt_phrases)
-        if not is_rel:
-            continue
-
-        score = rank_result(description, full_text, prompt_phrases, url=href, region=region)
+        # Выставим немного повышенный балл, чтобы карточки не потерялись в самом низу
+        base_score = 0.55
+        try:
+            base_score += 0.1 if any(p.lower() in (description or "").lower() for p in prompt_phrases[:3]) else 0.0
+        except Exception:
+            pass
 
         row = {
             "id": str(uuid.uuid4()),
             "name": name if name and name != "N/A" else "Affcatalog — партнёрская программа",
             "website": href,
             "description": description if description and description != "N/A" else "Партнёрская программа/каталог из Affcatalog (iGaming / casino / betting).",
-            "specialization": specialization,
             "country": country,
             "source": "Affcatalog",
-            "status": status,
-            "suitability": suitability,
-            "score": min(score, 0.95),
+            "score": min(max(base_score, 0.0), 0.95),
         }
         rows.append(row)
         seen_urls.add(href)
 
+    # Сохраним в БД/историю
     for r in rows:
         save_result_records(r, intent, region, query_id)
 
@@ -1144,19 +1115,22 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
 
 # ========= Persistence =========
 def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str, query_id: str):
+    """Пишем и в кратковременную таблицу results (для текущей выдачи), и в results_history (для обучения)."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
+            # В текущую выдачу (как раньше)
             c.execute(
                 """INSERT OR IGNORE INTO results
                    (id, name, website, description, specialization, country, source, status, suitability, score)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     row["id"], row.get("name","N/A"), row["website"], row.get("description","N/A"),
-                    row.get("specialization", ", ".join([]).title()), row.get("country","N/A"), row.get("source","Web"),
-                    row.get("status", "Active"), row.get("suitability", "Подходит"), row.get("score",0.0),
+                    ", ".join([]).title(), row.get("country","N/A"), row.get("source","Web"),
+                    "Active", "Подходит", row.get("score",0.0),
                 ),
             )
+            # В историю
             c.execute(
                 """INSERT OR IGNORE INTO results_history
                    (id, query_id, url, domain, source, score, intent_json, region, created_at)
@@ -1242,14 +1216,14 @@ def search():
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
-        max_results = int(data.get("max_results", 25))
-        user_urls = data.get("user_urls", [])
+        max_results = int(data.get("max_results", 15))
 
         if not user_query:
             return jsonify({"error": "Query is required"}), 400
 
         logger.info(f"API request: query='{user_query}', region={region}, engine={engine}")
 
+        # Очистим текущую выдачу (без DROP, чтобы не гоняться с воркерами)
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -1269,14 +1243,19 @@ def search():
             cursor.execute("DELETE FROM results")
             conn.commit()
 
+        # Генерация подзапросов
         web_queries, prompt_phrases, region, intent = generate_search_queries(user_query, region)
 
+        # Запишем сам запрос в историю — вернётся query_id
         query_id = insert_query_record(user_query, intent, region)
 
+        # Учитываем «обучение»: бусты по доменам
         boosts = history_boosts(intent, region)
 
+        # Если кириллица и регион дефолтный — для DDG используем ru-ru
         force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
 
+        # Собираем URL’ы
         all_urls = []
         for q in web_queries:
             if engine in ("ddg", "both"):
@@ -1288,11 +1267,14 @@ def search():
                     serpapi_search(q, max_results=max_results, region=region, intent=intent)
                 )
 
+        # Дедуп и отсев мусора по доменам
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if not is_bad_domain(domain_of(u))]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id, user_urls=user_urls)
+        # Скрейп
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
 
+        # Жёсткая финальная чистка
         filtered = []
         for r in web_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
@@ -1307,15 +1289,20 @@ def search():
                 continue
             filtered.append(r)
 
+        # ========= NEW: Добавляем 4–6 вариантов с affcatalog (для affiliate+casino) =========
         already_urls = set(r.get("website","") for r in filtered)
         aff_rows = scrape_affcatalog_suggestions(intent=intent, prompt_phrases=prompt_phrases, region=region, query_id=query_id, already_urls=already_urls)
 
+        # Добавим, но не засоряем дублями
         if aff_rows:
+            # лёгкая приоритизация: вставим их ближе к началу, но не на самый топ — повысим им score чуть-чуть
             for ar in aff_rows:
                 ar["score"] = min(ar.get("score", 0.55) + 0.05, 0.98)
             filtered.extend(aff_rows)
 
+        # Гео-приоритизация и сортировка
         all_results = prefer_country_results(filtered, region)
+        # финальный дедуп по урлу
         seen = set()
         deduped = []
         for r in all_results:
@@ -1328,6 +1315,7 @@ def search():
 
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
+        # Экспорты
         save_to_csv()
         save_to_txt()
 
@@ -1343,6 +1331,9 @@ def search():
 # ========= Feedback API =========
 @app.route("/feedback", methods=["POST"])
 def feedback():
+    """
+    body: { "query_id": "...", "url": "...", "action": "click|good|bad" }
+    """
     try:
         data = request.json or {}
         query_id = (data.get("query_id") or "").strip()
