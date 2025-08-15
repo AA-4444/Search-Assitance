@@ -1,3 +1,5 @@
+# file: app.py
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
@@ -7,16 +9,20 @@ import csv
 import random
 import logging
 import sqlite3
-import requests
-from datetime import datetime, timedelta
+import socket
+import ipaddress
+import threading
 from typing import List, Tuple, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urljoin
 
+import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from ddgs import DDGS
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib import robotparser
 
 # ========= Optional libs (present in env) =========
 try:
@@ -37,12 +43,12 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY", "").strip() or None
 
 MIN_RESULTS = int(os.getenv("MIN_RESULTS", "25"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "9"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "7"))
 PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "3"))
 STRONG_BLOCK_ON_BAD = (os.getenv("STRONG_BLOCK_ON_BAD", "true").lower() == "true")
 
-REQUEST_COUNT_FILE = "request_count.json"
+REQUEST_COUNT_FILE = os.getenv("REQUEST_COUNT_FILE", "request_count.json")
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1200"))
 REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.12"))
 REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.35"))
@@ -52,23 +58,23 @@ DEFAULT_UA = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
-# --- runtime guards for time-bounded scraping ---
-CURRENT_SCRAPE_DEADLINE_TS: float = 0.0
-ALLOW_MICROCRAWL: bool = False
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "7"))  # было 9
-SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "300"))  # было 180
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))  # было 16
-# SerpAPI — резерв + cooldown при 429
-SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 минут
-_last_serpapi_429_at = 0.0
-
-# Жёсткий дедлайн на скрапинг одной «волны»
 SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "180"))
+SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 минут
 
-# Микрокраул
 MAX_MICROCRAWL_PAGES = int(os.getenv("MAX_MICROCRAWL_PAGES", "1"))
 ENABLE_MICROCRAWL = (os.getenv("ENABLE_MICROCRAWL", "true").lower() == "true")
+
+# Новые (доп.) лимиты/кэш — не переименовывают существующие:
+DUCK_RATE_LIMIT_RPS = float(os.getenv("DUCK_RATE_LIMIT_RPS", "1.5"))
+SERPAPI_RATE_LIMIT_RPS = float(os.getenv("SERPAPI_RATE_LIMIT_RPS", "0.8"))
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", str(MAX_WORKERS)))
+CACHE_TTL_S = int(os.getenv("CACHE_TTL_S", "7200"))
+SEED_REFRESH_H = int(os.getenv("SEED_REFRESH_H", "24"))
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", os.getenv("RAILWAY_PORT", "8080")))
+FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
 
 # ======================= Logging =======================
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
@@ -76,7 +82,8 @@ logger = logging.getLogger("host")
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler("scraper.log", encoding="utf-8") if LOG_TO_FILE else logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
 
 # ======================= Flask =======================
 app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path="/")
@@ -122,6 +129,118 @@ CURRENCY_HINTS = {
 }
 ACCEPT_LANG_POOL = ["en,ru,uk;q=0.9", "ru,en;q=0.9", "en;q=0.8"]
 
+REGION_MAP = {
+    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com"},
+    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us"},
+    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk"},
+    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de"},
+    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr"},
+    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.com", "tld": "ru"},  # google.ru не используем
+    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com", "tld": "ua"},
+    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.com", "tld": "kz"},
+    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.com", "tld": "by"},
+    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr"},
+    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae"},
+    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in"},
+    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg"},
+    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es"},
+    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it"},
+    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl"},
+    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se"},
+    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no"},
+    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi"},
+    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz"},
+    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk"},
+    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro"},
+    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu"},
+    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch"},
+    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br"},
+    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx"},
+    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au"},
+    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
+}
+REGION_ALIAS = {
+    "kz-kk": "kz-ru",
+    "ua-ru": "ua-ua",
+    "ua-en": "ua-ua",
+    "kz-en": "kz-ru",
+}
+REGION_LANG_ALLOW = {
+    "ua-ua": ("uk", "ru", "en"),
+    "by-ru": ("ru", "en"),
+    "kz-ru": ("kk", "ru", "en"),
+    "ru-ru": ("ru", "en"),
+    "wt-wt": ("en", "ru", "uk"),
+}
+REGION_HINTS = {
+    "ua-ua": {
+        "tokens": ["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA"],
+        "org": ["ТОВ","ФОП","LLC","ПП","ПрАТ","АТ"],
+        "cities": ["Kyiv","Київ","Lviv","Львів","Odesa","Одеса","Kharkiv","Харків","Dnipro","Дніпро"]
+    },
+    "by-ru": {
+        "tokens": ["Беларусь","Belarus","Минск","Minsk","BY","Гродно","Брест","Гомель","Витебск","Могилев"],
+        "org": ["ООО","ЧУП","ЗАО","ОАО"],
+        "cities": ["Минск","Minsk","Гродно","Брест","Гомель","Витебск","Могилев"]
+    },
+    "kz-ru": {
+        "tokens": ["Казахстан","Kazakhstan","Қазақстан","Алматы","Almaty","Астана","Astana","Нур-Султан","Шымкент","Karaganda","Караганда","KZ"],
+        "org": ["ТОО","LLP","ИП","ЖШС"],
+        "cities": ["Алматы","Almaty","Астана","Astana","Шымкент","Караганда"]
+    },
+    "ru-ru": {
+        "tokens": ["Россия","Russian Federation","Москва","Санкт-Петербург","Новосибирск","Екатеринбург","RF","RU"],
+        "org": ["ООО","АО","ИП","ПАО","ЗАО","ОАО"],
+        "cities": ["Москва","Санкт-Петербург","Новосибирск","Екатеринбург","Казань","Нижний Новгород"]
+    },
+}
+
+INTENT_AFFILIATE = {
+    "affiliate","аффилиат","партнерка","партнёрка","партнерская программа","партнёрская программа",
+    "реферальная","referral","cpa","igaming","casino","casino affiliate","affiliate network",
+    "опм","outsourced affiliate program management","opm"
+}
+INTENT_LEARN = {
+    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to",
+    "що таке","лекция","лекція"
+}
+CASINO_TOKENS = {"казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","sportsbook","bookmaker","slots","poker"}
+
+BAD_DOMAINS_HARD = {
+    "google.com","maps.google.com","baidu.com","zhihu.com",
+    "xnxx.com","pornhub.com",
+    "addons.mozilla.org","microsoft.com","support.microsoft.com","edge.microsoft.com",
+    "minecraft.net","curseforge.com","planetminecraft.com","softonic.com","apkpure.com","apkcombo.com","uptodown.com",
+}
+SOFT_BAD_DOMAINS = {
+    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org","uk.wikipedia.org",
+    "work.ua","rabota.ua","hh.ru","jobs.ua","djinni.co","indeed.com","glassdoor.com",
+    "facebook.com","instagram.com","x.com","twitter.com","vk.com","ok.ru",
+}
+BLOG_HINTS_URL = ("/blog","/news","/article","/articles","/insights","/guide","/guides","/academy","/press","/glossary")
+JOBS_HINTS_URL = ("/jobs","/job","/careers","/vacancies","/vacancy","/rabota","/vakans","/career")
+EVENT_HINTS = ("conference","expo","summit","event","exhibition","agenda","speakers")
+DIRECTORY_HINTS = ("directory","catalog","list","listing","rank","rating","top-","compare","comparison")
+CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
+
+OPERATOR_PROGRAM_HINTS = (
+    "join our affiliate program","affiliates program","affiliate portal","commission",
+    "revshare","cpa","commission tiers","promotional materials","tracking platform",
+    "program terms","payouts","banners","affiliates terms","sign up and start promoting"
+)
+NETWORK_FOR_PUBLISHERS_HINTS = (
+    "for affiliates","for publishers","become an affiliate","sign up as an affiliate",
+    "traffic sources","webmasters","start promoting","affiliate network"
+)
+COMPANY_SERVICE_HINTS = (
+    "our services","services","solutions","platform","for operators","for brands","for advertisers",
+    "clients","case study","case studies","features","integrations","pricing",
+    "request a demo","get a demo","contact sales","schedule a call","request proposal",
+    "program management","affiliate management","opm","outsourced program management"
+)
+B2C_NOISE = ("tournament","prize drop","drops","free spins","bonus terms","bonus", "€","$","₴","₸")
+
+# ======================= Utils =======================
 def clean_text(s: str) -> str:
     if not s: return ""
     t = s.strip()
@@ -173,7 +292,73 @@ def detect_encoding(content: bytes) -> str:
             pass
     return "utf-8"
 
-# ======================= DB =======================
+# ======================= Security (SSRF-safe) =======================
+def _is_private_ip(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+        for family, _type, _proto, _canon, sockaddr in infos:
+            ip = sockaddr[0]
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
+                return True
+        return False
+    except Exception:
+        return True  # safe default: block
+
+# ======================= Token Bucket & Circuit Breaker =======================
+class TokenBucket:
+    def __init__(self, rate_per_sec: float, burst: float):
+        self.rate = rate_per_sec
+        self.capacity = burst
+        self.tokens = burst
+        self.lock = threading.Lock()
+        self.last = time.monotonic()
+    def take(self, tokens: float = 1.0):
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+            self.last = now
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+    def wait(self, tokens: float = 1.0):
+        while not self.take(tokens):
+            time.sleep(0.01)
+
+class CircuitBreaker:
+    def __init__(self, fail_threshold:int=5, reset_after: float=60.0):
+        self.fail_threshold = fail_threshold
+        self.reset_after = reset_after
+        self.fail_count = 0
+        self.opened_at = 0.0
+        self.lock = threading.Lock()
+    def record_success(self):
+        with self.lock:
+            self.fail_count = 0
+            self.opened_at = 0.0
+    def record_failure(self):
+        with self.lock:
+            self.fail_count += 1
+            if self.fail_count >= self.fail_threshold and self.opened_at == 0.0:
+                self.opened_at = time.time()
+    def allow(self) -> bool:
+        with self.lock:
+            if self.opened_at == 0.0:
+                return True
+            if (time.time() - self.opened_at) >= self.reset_after:
+                self.fail_count = 0
+                self.opened_at = 0.0
+                return True
+            return False
+
+duck_bucket = TokenBucket(DUCK_RATE_LIMIT_RPS, burst=max(2.0, DUCK_RATE_LIMIT_RPS))
+serp_bucket = TokenBucket(SERPAPI_RATE_LIMIT_RPS, burst=max(1.0, SERPAPI_RATE_LIMIT_RPS))
+duck_cb = CircuitBreaker()
+serp_cb = CircuitBreaker()
+_last_serpapi_429_at = 0.0
+
+# ======================= DB & Cache =======================
 def init_db():
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -222,6 +407,7 @@ def init_db():
                     domain TEXT,
                     action TEXT,
                     weight REAL,
+                    user_id TEXT,
                     created_at TEXT
                 )"""
             )
@@ -232,6 +418,32 @@ def init_db():
                     reason TEXT
                 )"""
             )
+            # cache & rate state & seeds
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS crawl_cache (
+                    key TEXT PRIMARY KEY,
+                    value BLOB,
+                    created_at REAL
+                )"""
+            )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS rate_state (
+                    engine TEXT PRIMARY KEY,
+                    last_count INTEGER,
+                    last_reset TEXT
+                )"""
+            )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS seeds (
+                    id TEXT PRIMARY KEY,
+                    url TEXT,
+                    domain TEXT,
+                    title TEXT,
+                    snippet TEXT,
+                    source TEXT,
+                    refreshed_at TEXT
+                )"""
+            )
             conn.commit()
         logger.info("Database initialized")
     except Exception as e:
@@ -239,127 +451,160 @@ def init_db():
 
 init_db()
 
-# ======================= Regions =======================
-REGION_MAP = {
-    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com"},
-    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us"},
-    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk"},
-    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de"},
-    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr"},
-    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.ru", "tld": "ru"},
-    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com.ua", "tld": "ua"},
-    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.kz", "tld": "kz"},
-    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.by", "tld": "by"},
-    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr"},
-    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae"},
-    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in"},
-    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg"},
-    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es"},
-    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it"},
-    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl"},
-    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se"},
-    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no"},
-    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi"},
-    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz"},
-    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk"},
-    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro"},
-    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu"},
-    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch"},
-    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br"},
-    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx"},
-    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au"},
-    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
-}
-# Алиасы регионов
-REGION_ALIAS = {
-    "kz-kk": "kz-ru",
-    "ua-ru": "ua-ua",
-    "ua-en": "ua-ua",
-    "kz-en": "kz-ru",
-}
+def cache_get(key: str) -> Optional[bytes]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT value, created_at FROM crawl_cache WHERE key=?", (key,))
+            row = c.fetchone()
+            if not row:
+                return None
+            value, created = row
+            if (time.time() - float(created)) > CACHE_TTL_S:
+                c.execute("DELETE FROM crawl_cache WHERE key=?", (key,))
+                conn.commit()
+                return None
+            return value
+    except Exception as e:
+        logger.debug(f"cache_get error: {e}")
+        return None
 
-REGION_LANG_ALLOW = {
-    "ua-ua": ("uk", "ru", "en"),
-    "by-ru": ("ru", "en"),
-    "kz-ru": ("kk", "ru", "en"),
-    "ru-ru": ("ru", "en"),
-    "wt-wt": ("en", "ru", "uk"),
-}
+def cache_set(key: str, value: bytes):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO crawl_cache (key, value, created_at) VALUES (?, ?, ?)",
+                      (key, value, time.time()))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"cache_set error: {e}")
 
-REGION_HINTS = {
-    "ua-ua": {
-        "tokens": ["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA"],
-        "org": ["ТОВ","ФОП","LLC","ПП","ПрАТ","АТ"],
-        "cities": ["Kyiv","Київ","Lviv","Львів","Odesa","Одеса","Kharkiv","Харків","Dnipro","Дніпро"]
-    },
-    "by-ru": {
-        "tokens": ["Беларусь","Belarus","Минск","Minsk","BY","Гродно","Брест","Гомель","Витебск","Могилев"],
-        "org": ["ООО","ЧУП","ЗАО","ОАО"],
-        "cities": ["Минск","Minsk","Гродно","Брест","Гомель","Витебск","Могилев"]
-    },
-    "kz-ru": {
-        "tokens": ["Казахстан","Kazakhstan","Қазақстан","Алматы","Almaty","Астана","Astana","Нур-Султан","Шымкент","Karaganda","Караганда","KZ"],
-        "org": ["ТОО","LLP","ИП","ЖШС"],
-        "cities": ["Алматы","Almaty","Астана","Astana","Шымкент","Караганда"]
-    },
-    "ru-ru": {
-        "tokens": ["Россия","Russian Federation","Москва","Санкт-Петербург","Новосибирск","Екатеринбург","RF","RU"],
-        "org": ["ООО","АО","ИП","ПАО","ЗАО","ОАО"],
-        "cities": ["Москва","Санкт-Петербург","Новосибирск","Екатеринбург","Казань","Нижний Новгород"]
-    },
-}
+# ======================= Request counter (per-day) =======================
+def _load_request_count():
+    try:
+        with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "engines" not in data:
+                data = {"engines": {"ddg": {"count": data.get("count", 0)}, "serpapi": {"count": 0}},
+                        "last_reset": data.get("last_reset", datetime.now().strftime("%Y-%m-%d"))}
+            last_reset_date = datetime.strptime(data["last_reset"], "%Y-%m-%d")
+            if last_reset_date.date() < datetime.now().date():
+                return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+            return data
+    except Exception:
+        return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
 
-# ======================= Intent / Filters =======================
-INTENT_AFFILIATE = {
-    "affiliate","аффилиат","аффилиэйт","партнерка","партнёрка","партнерская программа","партнёрская программа",
-    "реферальная","referral","cpa","игемблинг","игейминг","igaming","casino affiliate","affiliate network",
-    "партнеры казино","партнёры казино","аффилейт","афилейт","opm","outsourced affiliate program management"
-}
-INTENT_LEARN = {
-    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to",
-    "що таке","лекция","лекція"
-}
-CASINO_TOKENS = {"казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","sportsbook","bookmaker","slots","poker"}
+def _save_request_count(data):
+    try:
+        with open(REQUEST_COUNT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Failed to save request count: {e}")
 
-BAD_DOMAINS_HARD = {
-    "google.com","maps.google.com","baidu.com","zhihu.com","commentcamarche.net",
-    "xnxx.com","pornhub.com",
-    "addons.mozilla.org","microsoft.com","support.microsoft.com","edge.microsoft.com",
-    "minecraft.net","curseforge.com","planetminecraft.com","softonic.com","apkpure.com","apkcombo.com","uptodown.com",
-}
+def _bump_counter(engine: str):
+    data = _load_request_count()
+    if engine not in data["engines"]:
+        data["engines"][engine] = {"count": 0}
+    data["engines"][engine]["count"] = int(data["engines"][engine].get("count", 0)) + 1
+    _save_request_count(data)
 
-SOFT_BAD_DOMAINS = {
-    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org","uk.wikipedia.org",
-    "work.ua","rabota.ua","hh.ru","jobs.ua","djinni.co","indeed.com","glassdoor.com",
-    "facebook.com","instagram.com","x.com","twitter.com","vk.com","ok.ru",
-}
+def _engine_allowed(engine: str) -> bool:
+    data = _load_request_count()
+    cnt = int(data["engines"].get(engine, {}).get("count", 0))
+    return cnt < DAILY_REQUEST_LIMIT
 
-BLOG_HINTS_URL = ("/blog","/news","/article","/articles","/insights","/guide","/guides","/academy","/press","/glossary")
-JOBS_HINTS_URL = ("/jobs","/job","/careers","/vacancies","/vacancy","/rabota","/vakans","/career")
-EVENT_HINTS = ("conference","expo","summit","event","exhibition","agenda","speakers")
-DIRECTORY_HINTS = ("directory","catalog","list","listing","rank","rating","top-","compare","comparison")
-CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
+# ======================= Robots & Fetch =======================
+robots_cache: Dict[str, robotparser.RobotFileParser] = {}
+robots_lock = threading.Lock()
 
-# Анти-сигналы: операторские «порталы» для вебмастеров
-OPERATOR_PROGRAM_HINTS = (
-    "join our affiliate program","affiliates program","affiliate portal","commission",
-    "revshare","cpa","commission tiers","promotional materials","tracking platform",
-    "program terms","payouts","banners","affiliates terms","sign up and start promoting"
-)
-NETWORK_FOR_PUBLISHERS_HINTS = (
-    "for affiliates","for publishers","become an affiliate","sign up as an affiliate",
-    "traffic sources","webmasters","start promoting","affiliate network"
-)
+def robots_allowed(url: str, user_agent: str = "Mozilla/5.0") -> bool:
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc
+        scheme = parsed.scheme or "http"
+        base = f"{scheme}://{host}"
+        with robots_lock:
+            rp = robots_cache.get(host)
+            if not rp:
+                rp = robotparser.RobotFileParser()
+                rp.set_url(urljoin(base, "/robots.txt"))
+                try:
+                    rp.read()
+                except Exception:
+                    pass
+                robots_cache[host] = rp
+        return rp.can_fetch(user_agent, url)
+    except Exception:
+        return True
 
-# Сигналы услуг/управления для операторов (агентства/OPM/платформы)
-COMPANY_SERVICE_HINTS = (
-    "our services","services","solutions","platform","for operators","for brands","for advertisers",
-    "clients","case study","case studies","features","integrations","pricing",
-    "request a demo","get a demo","contact sales","schedule a call","request proposal",
-    "program management","affiliate management","opm","outsourced program management"
-)
+def _request_headers():
+    return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL)}
 
-# ======================= Utility filters =======================
+def _http_get(url: str) -> Optional[requests.Response]:
+    try:
+        pu = urlparse(url)
+        host = pu.hostname or ""
+        if not host or _is_private_ip(host):
+            return None
+        if not robots_allowed(url, DEFAULT_UA):
+            return None
+        # Rate-limit fetching via bucket on thread pool level — concurrency capped globally
+        resp = requests.get(url, headers=_request_headers(), timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if resp.status_code >= 400: return None
+        ct = (resp.headers.get("Content-Type","") or "").lower()
+        if "text/html" not in ct and "application/xhtml" not in ct:
+            return None
+        return resp
+    except Exception:
+        return None
+
+def extract_text_for_classification(html: bytes) -> Tuple[str, str, List[Tuple[str,str]]]:
+    if not html: return "", "", []
+    enc = detect_encoding(html)
+    try:
+        soup = BeautifulSoup(html.decode(enc, errors="ignore"), "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    for bad in soup(["script", "style", "noscript", "svg", "picture", "source"]):
+        bad.decompose()
+
+    title = (soup.title.string if soup.title and soup.title.string else "").strip()
+    md = soup.select_one("meta[name='description']") or soup.select_one("meta[property='og:description']")
+    meta_desc = md["content"].strip() if (md and md.get("content")) else ""
+    heads = " ".join(h.get_text(" ", strip=True) for h in soup.select("h1, h2, h3")[:8])
+    paras = " ".join(p.get_text(" ", strip=True) for p in soup.select("p")[:14])
+    text = re.sub(r"\s+", " ", " ".join([meta_desc, heads, paras]).strip())
+
+    links = []
+    for a in soup.select("a[href]")[:220]:
+        href = a.get("href") or ""
+        txt = a.get_text(" ", strip=True)[:120]
+        if href:
+            links.append((txt, href))
+    return short(title, 180), text, links
+
+def _absolute_url(base_url: str, href: str) -> Optional[str]:
+    try:
+        if not href or href.startswith(("javascript:", "mailto:")): return None
+        return urljoin(base_url, href)
+    except Exception:
+        return None
+
+def pick_microcrawl_targets(base_url: str, links: List[Tuple[str,str]]) -> List[str]:
+    targets, seen = [], set()
+    for txt, href in links:
+        t = (txt or "").lower(); u = (href or "").lower()
+        if any(k in u for k in ("/contact","/contacts","/about","/about-us","/services","/solutions","/platform","/company")) \
+           or any(k in t for k in ("contact","contacts","about","services","solutions","platform","company")):
+            absu = _absolute_url(base_url, href)
+            if absu:
+                p = urlparse(absu).path
+                if p not in seen:
+                    targets.append(absu); seen.add(p)
+        if len(targets) >= MAX_MICROCRAWL_PAGES: break
+    return targets
+
+# ======================= Classification & Scoring =======================
 def looks_like_job(url: str, text: str) -> bool:
     u = url.lower()
     if any(tok in u for tok in JOBS_HINTS_URL): return True
@@ -394,6 +639,124 @@ def is_hard_bad_domain(dom: str) -> bool:
     if d.startswith("www."): d = d[4:]
     return d in BAD_DOMAINS_HARD
 
+def is_network_for_publishers(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in NETWORK_FOR_PUBLISHERS_HINTS)
+
+def is_operator_program(url: str, text: str) -> bool:
+    u = url.lower(); t = (text or "").lower()
+    if any(tok in u for tok in CASINO_TLDS): return True
+    if any(tok in t for tok in OPERATOR_PROGRAM_HINTS): return True
+    if "/affiliate" in u or "/affiliates" in u:
+        if "for operators" in t or "for brands" in t or "for advertisers" in t or "platform" in t:
+            return False
+        return True
+    return False
+
+def is_company_or_platform(url: str, text: str) -> bool:
+    t = (text or "").lower()
+    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced","program management","affiliate management"))
+    has_ig  = any(k in t for k in ("igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker","poker","slots"))
+    if not (has_aff and has_ig): return False
+    has_company = any(k in t for k in COMPANY_SERVICE_HINTS)
+    if not has_company: return False
+    if is_network_for_publishers(t): return False
+    return True
+
+def looks_like_b2c_promo(text: str) -> bool:
+    t = (text or "").lower()
+    if any(k in t for k in B2C_NOISE):
+        if ("services" not in t and "solutions" not in t and "management" not in t and "for operators" not in t):
+            return True
+    return False
+
+def classify_kind(url: str, text: str) -> str:
+    if looks_like_job(url, text): return "jobs"
+    if looks_like_event(url, text): return "event"
+    if looks_like_directory(url, text): return "directory"
+    if looks_like_blog(url, text): return "blog"
+    if is_operator_program(url, text): return "operator_program"
+    if is_company_or_platform(url, text): return "company_or_platform"
+    return "junk"
+
+def language_ok(text: str, region: str) -> bool:
+    allowed = REGION_LANG_ALLOW.get(REGION_ALIAS.get(region, region), REGION_LANG_ALLOW["wt-wt"])
+    lang = guess_lang(text)
+    return lang in allowed
+
+def quality_score(url: str, text: str) -> float:
+    t = (text or "").lower()
+    score = 0.0
+    if url.lower().startswith("https://"): score += 0.06
+    for k in ("about","contact","services","solutions","platform","features","pricing","clients","case"):
+        if k in t: score += 0.02
+    if re.search(r"20(2[3-6])", t): score += 0.05
+    return min(score, 0.4)
+
+def agency_boost(text: str) -> float:
+    t = (text or "").lower()
+    boost = 0.0
+    if "agency" in t or "агентств" in t or "opm" in t or "program management" in t: boost += 0.12
+    if "for operators" in t or "for brands" in t or "for advertisers" in t: boost += 0.08
+    if "platform" in t and "features" in t and "pricing" in t: boost -= 0.05
+    if "affiliate network" in t or is_network_for_publishers(t): boost -= 0.25
+    return max(-0.3, min(0.2, boost))
+
+def region_affinity(url: str, text: str, region: str) -> float:
+    reg_key = REGION_ALIAS.get(region, region)
+    reg = REGION_MAP.get(reg_key, REGION_MAP["wt-wt"]); tld = "." + reg["tld"] if reg.get("tld") else ""
+    u = url.lower(); t = (text or "").lower(); score = 0.0
+    if tld and u.endswith(tld): score += 0.55
+    hints = REGION_HINTS.get(reg_key, {})
+    tokens = [x.lower() for x in hints.get("tokens", [])]
+    orgs = [x.lower() for x in hints.get("org", [])]
+    cities = [x.lower() for x in hints.get("cities", [])]
+    if tokens and any(tok in t for tok in tokens): score += 0.25
+    if orgs and any(o in t for o in orgs): score += 0.20
+    if cities and any(c in t for c in cities): score += 0.15
+    rex = PHONE_CODE_RE.get(reg_key);  cur = CURRENCY_HINTS.get(reg_key)
+    if rex and rex.search(t): score += 0.30
+    if cur and any(sym.lower() in t for sym in [c.lower() for c in cur[0]]): score += cur[1]
+    if language_ok(t, reg_key): score += 0.15
+    else: score -= 0.30
+    if tld and (not u.endswith(tld)) and not (tokens and any(tok in t for tok in tokens)): score -= 0.25
+    return max(0.0, min(1.0, score))
+
+def base_relevance(text: str) -> float:
+    t = (text or "").lower(); rel = 0.0
+    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced","program management","affiliate management")): rel += 0.45
+    if any(k in t for k in ("igaming","casino","беттинг","sportsbook","bookmaker","poker","slots","gambling")): rel += 0.4
+    if any(k in t for k in ("for operators","for brands","for advertisers","clients","case study","platform","services","solutions")): rel += 0.25
+    return max(0.0, min(1.0, rel))
+
+def domain_feedback_adjustment(domain: str) -> float:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT
+                  SUM(CASE WHEN action='good' THEN weight ELSE 0 END),
+                  SUM(CASE WHEN action='click' THEN weight ELSE 0 END),
+                  SUM(CASE WHEN action='bad' THEN weight ELSE 0 END)
+                FROM interactions WHERE domain=?
+            """, (domain,))
+            row = c.fetchone() or (0,0,0)
+            good, click, bad = (row[0] or 0.0), (row[1] or 0.0), (row[2] or 0.0)
+            boost = 0.2*min(good,10) + 0.06*min(click,20) - 0.6*min(bad,10)
+            return max(-0.6, min(0.4, boost))
+    except Exception:
+        return 0.0
+
+def score_item(url: str, text: str, region: str, jitter_seed: int) -> float:
+    d = domain_of(url)
+    base = 0.85*base_relevance(text) + 1.1*region_affinity(url, text, region) + quality_score(url, text) \
+           + domain_feedback_adjustment(d) + agency_boost(text)
+    if any(url.lower().endswith(ct) for ct in CASINO_TLDS): base -= 0.2
+    rnd = random.Random(hash(d + str(jitter_seed)) & 0xffffffff).uniform(-0.06, 0.06)
+    score = base + rnd
+    return max(0.0, min(2.2, score))
+
+# ======================= Intent / Filters =======================
 def detect_intent(q: str) -> Dict[str, bool]:
     t = (q or "").lower()
     affiliate = any(k in t for k in INTENT_AFFILIATE)
@@ -401,41 +764,6 @@ def detect_intent(q: str) -> Dict[str, bool]:
     casino = any(k in t for k in CASINO_TOKENS)
     return {"affiliate": affiliate or casino, "learn": learn, "casino": casino, "business": not learn}
 
-# ======================= Request counter =======================
-def _load_request_count():
-    try:
-        with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "engines" not in data:
-                data = {"engines": {"ddg": {"count": data.get("count", 0)}, "serpapi": {"count": 0}},
-                        "last_reset": data.get("last_reset", datetime.now().strftime("%Y-%m-%d"))}
-            last_reset_date = datetime.strptime(data["last_reset"], "%Y-%m-%d")
-            if last_reset_date.date() < datetime.now().date():
-                return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
-            return data
-    except Exception:
-        return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
-
-def _save_request_count(data):
-    try:
-        with open(REQUEST_COUNT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"Failed to save request count: {e}")
-
-def _bump_counter(engine: str):
-    data = _load_request_count()
-    if engine not in data["engines"]:
-        data["engines"][engine] = {"count": 0}
-    data["engines"][engine]["count"] = int(data["engines"][engine].get("count", 0)) + 1
-    _save_request_count(data)
-
-def _engine_allowed(engine: str) -> bool:
-    data = _load_request_count()
-    cnt = int(data["engines"].get(engine, {}).get("count", 0))
-    return cnt < DAILY_REQUEST_LIMIT
-
-# ======================= Query building =======================
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
     parts = [q]
     parts += ["-site:wikipedia.org", "-site:facebook.com", "-site:instagram.com", "-site:x.com", "-site:twitter.com", "-site:vk.com", "-site:ok.ru"]
@@ -471,7 +799,6 @@ def build_core_queries(user_prompt: str) -> List[str]:
     return out
 
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
-    # Алиасы
     region = REGION_ALIAS.get(region, region)
     reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
     tld = reg["tld"]
@@ -493,7 +820,73 @@ def apply_geo_bias(queries: List[str], region: str) -> List[str]:
             out.append(q)
     return out
 
-# ======================= Learning (feedback) =======================
+# ======================= Search engines =======================
+def duckduckgo_search(query, max_results=25, region="wt-wt"):
+    if not _engine_allowed("ddg") or not duck_cb.allow():
+        return []
+    duck_bucket.wait(1.0)
+    urls = []
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(query, region=region, safesearch="moderate", timelimit="y", max_results=max_results)
+            for r in results:
+                href = r.get("href")
+                if href: urls.append(href)
+        _bump_counter("ddg")
+        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+        urls = [normalize_url(u) for u in urls if not is_hard_bad_domain(domain_of(u))]
+        duck_cb.record_success()
+        return list(dict.fromkeys(urls))[:max_results]
+    except Exception as e:
+        duck_cb.record_failure()
+        logger.error(f"DDG failed for '{query}': {e}")
+        return []
+
+def serpapi_search(query, max_results=25, region="wt-wt"):
+    global _last_serpapi_429_at
+    if not SERPAPI_API_KEY:
+        return []
+    if (time.time() - _last_serpapi_429_at) < SERPAPI_COOLDOWN_SEC:
+        return []
+    if not _engine_allowed("serpapi") or not serp_cb.allow():
+        return []
+    serp_bucket.wait(1.0)
+    reg = REGION_MAP.get(REGION_ALIAS.get(region, region), REGION_MAP["wt-wt"])
+    params = {
+        "engine": "google",
+        "q": query,
+        "num": max_results,
+        "api_key": SERPAPI_API_KEY,
+        "hl": reg["hl"],
+        "gl": reg["gl"],
+        "google_domain": reg["google_domain"],
+    }
+    try:
+        r = requests.get("https://serpapi.com/search.json", params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        urls = [it.get("link") for it in data.get("organic_results", []) if it.get("link")]
+        for block in ("inline_results","local_results","top_stories"):
+            for it in data.get(block, []) or []:
+                link = it.get("link") or it.get("source")
+                if link: urls.append(link)
+        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+        _bump_counter("serpapi")
+        urls = [normalize_url(u) for u in urls if not is_hard_bad_domain(domain_of(u))]
+        serp_cb.record_success()
+        return list(dict.fromkeys(urls))[:max_results]
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            logger.warning("SerpAPI 429: enabling cooldown")
+            _last_serpapi_429_at = time.time()
+        serp_cb.record_failure()
+        return []
+    except Exception as e:
+        serp_cb.record_failure()
+        logger.warning(f"SerpAPI error: {e}")
+        return []
+
+# ======================= Domain block & feedback =======================
 BAD_BLOCK_DAYS = 60
 
 def _block_domain(domain: str, reason: str = "user_bad", days: int = BAD_BLOCK_DAYS):
@@ -534,148 +927,11 @@ def domain_is_blocked(domain: str) -> bool:
     except Exception:
         return False
 
-def domain_feedback_adjustment(domain: str) -> float:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT
-                  SUM(CASE WHEN action='good' THEN weight ELSE 0 END),
-                  SUM(CASE WHEN action='click' THEN weight ELSE 0 END),
-                  SUM(CASE WHEN action='bad' THEN weight ELSE 0 END)
-                FROM interactions WHERE domain=?
-            """, (domain,))
-            row = c.fetchone() or (0,0,0)
-            good, click, bad = (row[0] or 0.0), (row[1] or 0.0), (row[2] or 0.0)
-            boost = 0.2*min(good,10) + 0.06*min(click,20) - 0.6*min(bad,10)
-            return max(-0.6, min(0.4, boost))
-    except Exception:
-        return 0.0
+# ======================= Scraping & Microcrawl =======================
+CURRENT_SCRAPE_DEADLINE_TS: float = 0.0
+ALLOW_MICROCRAWL: bool = False
 
-# ======================= Search engines =======================
-def duckduckgo_search(query, max_results=25, region="wt-wt"):
-    if not _engine_allowed("ddg"):
-        logger.error("Daily request limit reached for DDG")
-        return []
-    urls = []
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(query, region=region, safesearch="moderate", timelimit="y", max_results=max_results)
-            for r in results:
-                href = r.get("href")
-                if href: urls.append(href)
-        _bump_counter("ddg")
-        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-        urls = [normalize_url(u) for u in urls if not is_hard_bad_domain(domain_of(u))]
-        return list(dict.fromkeys(urls))[:max_results]
-    except Exception as e:
-        logger.error(f"DDG failed for '{query}': {e}")
-        return []
-
-def serpapi_search(query, max_results=25, region="wt-wt"):
-    global _last_serpapi_429_at
-    if not SERPAPI_API_KEY:
-        return []
-    if (time.time() - _last_serpapi_429_at) < SERPAPI_COOLDOWN_SEC:
-        return []
-    if not _engine_allowed("serpapi"):
-        logger.warning("Daily request limit reached for SerpAPI")
-        return []
-    reg = REGION_MAP.get(REGION_ALIAS.get(region, region), REGION_MAP["wt-wt"])
-    params = {
-        "engine": "google",
-        "q": query,
-        "num": max_results,
-        "api_key": SERPAPI_API_KEY,
-        "hl": reg["hl"],
-        "gl": reg["gl"],
-        "google_domain": reg["google_domain"],
-    }
-    try:
-        r = requests.get("https://serpapi.com/search.json", params=params, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        urls = [it.get("link") for it in data.get("organic_results", []) if it.get("link")]
-        for block in ("inline_results","local_results","top_stories"):
-            for it in data.get(block, []) or []:
-                link = it.get("link") or it.get("source")
-                if link: urls.append(link)
-        time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
-        _bump_counter("serpapi")
-        urls = [normalize_url(u) for u in urls if not is_hard_bad_domain(domain_of(u))]
-        return list(dict.fromkeys(urls))[:max_results]
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            logger.warning("SerpAPI 429: enabling cooldown")
-            _last_serpapi_429_at = time.time()
-        else:
-            logger.warning(f"SerpAPI error: {e}")
-        return []
-    except Exception as e:
-        logger.warning(f"SerpAPI error: {e}")
-        return []
-
-# ======================= Scraping & Deep analysis =======================
-def _request_headers():
-    return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL)}
-
-def _http_get(url: str) -> Optional[requests.Response]:
-    try:
-        resp = requests.get(url, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
-        if resp.status_code >= 400: return None
-        ct = (resp.headers.get("Content-Type","") or "").lower()
-        if "text/html" not in ct and "application/xhtml" not in ct: return None
-        return resp
-    except Exception:
-        return None
-
-def extract_text_for_classification(html: bytes) -> Tuple[str, str, List[Tuple[str,str]]]:
-    if not html: return "", "", []
-    enc = detect_encoding(html)
-    try:
-        soup = BeautifulSoup(html.decode(enc, errors="ignore"), "lxml")
-    except Exception:
-        soup = BeautifulSoup(html, "html.parser")
-    for bad in soup(["script", "style", "noscript", "svg", "picture", "source"]):
-        bad.decompose()
-
-    title = (soup.title.string if soup.title and soup.title.string else "").strip()
-    md = soup.select_one("meta[name='description']") or soup.select_one("meta[property='og:description']")
-    meta_desc = md["content"].strip() if (md and md.get("content")) else ""
-    heads = " ".join(h.get_text(" ", strip=True) for h in soup.select("h1, h2, h3")[:8])
-    paras = " ".join(p.get_text(" ", strip=True) for p in soup.select("p")[:12])
-    text = re.sub(r"\s+", " ", " ".join([meta_desc, heads, paras]).strip())
-
-    links = []
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        txt = a.get_text(" ", strip=True)[:120]
-        if href and len(links) < 200:
-            links.append((txt, href))
-    return short(title, 180), text, links
-
-def _absolute_url(base_url: str, href: str) -> Optional[str]:
-    try:
-        if not href or href.startswith(("javascript:", "mailto:")): return None
-        return urljoin(base_url, href)
-    except Exception:
-        return None
-
-def pick_microcrawl_targets(base_url: str, links: List[Tuple[str,str]]) -> List[str]:
-    targets, seen = [], set()
-    for txt, href in links:
-        t = (txt or "").lower(); u = (href or "").lower()
-        if any(k in u for k in ("/contact","/contacts","/about","/about-us","/services","/solutions","/platform","/company")) \
-           or any(k in t for k in ("contact","contacts","about","services","solutions","platform","company")):
-            absu = _absolute_url(base_url, href)
-            if absu:
-                p = urlparse(absu).path
-                if p not in seen:
-                    targets.append(absu); seen.add(p)
-        if len(targets) >= MAX_MICROCRAWL_PAGES: break
-    return targets
-
-def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
+def fetch_one(url: str, region: str, allow_microcrawl: bool) -> Optional[Dict[str,Any]]:
     try:
         if not url or is_hard_bad_domain(domain_of(url)): return None
         if domain_is_blocked(domain_of(url)): return None
@@ -684,143 +940,233 @@ def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
         title, text, links = extract_text_for_classification(resp.content)
         if not text: return None
 
-        t_low = text.lower()
-        # быстрая отбраковка сетей "для вебмастеров"
-        if any(h in t_low for h in NETWORK_FOR_PUBLISHERS_HINTS):
-            return None
+        # быстрые отбраковки
+        if is_network_for_publishers(text): return None
+        if looks_like_b2c_promo(text): return None
 
-        # микрокраул — строго при необходимости
-             # микрокраул — только в релакс-фазах и если остаётся запас времени
+        # Микрокраул для уточнения фактов (строго по времени/флагу)
         extras_text = ""
-        if ENABLE_MICROCRAWL and ALLOW_MICROCRAWL and (time.time() < CURRENT_SCRAPE_DEADLINE_TS - 20):
-            if need_more_region or need_company:
-                for ex_url in pick_microcrawl_targets(url, links):
-                    if time.time() >= CURRENT_SCRAPE_DEADLINE_TS - 10:
-                        break
-                    ex_resp = _http_get(ex_url)
-                    if not ex_resp:
-                        continue
-                    _, ex_text, _ = extract_text_for_classification(ex_resp.content)
-                    if ex_text:
-                        extras_text += " " + short(ex_text, 1200)
+        if ENABLE_MICROCRAWL and allow_microcrawl and (time.time() < CURRENT_SCRAPE_DEADLINE_TS - 20):
+            for ex_url in pick_microcrawl_targets(url, links):
+                if time.time() >= CURRENT_SCRAPE_DEADLINE_TS - 10:
+                    break
+                ex_resp = _http_get(ex_url)
+                if not ex_resp:
+                    continue
+                _, ex_text, _ = extract_text_for_classification(ex_resp.content)
+                if ex_text:
+                    extras_text += " " + short(ex_text, 1200)
 
         full_text = (text + " " + extras_text).strip()
         return {"url": url, "name": title or "N/A", "text": full_text}
     except Exception:
         return None
 
-# ======================= Classification & Scoring =======================
-def is_operator_program(url: str, text: str) -> bool:
-    u = url.lower(); t = (text or "").lower()
-    if any(tok in u for tok in CASINO_TLDS): return True
-    if any(tok in t for tok in OPERATOR_PROGRAM_HINTS): return True
-    if "/affiliate" in u or "/affiliates" in u:
-        if "for operators" in t or "for brands" in t or "for advertisers" in t or "platform" in t:
-            return False
-        return True
-    return False
-
-def is_network_for_publishers(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in NETWORK_FOR_PUBLISHERS_HINTS)
-
-def is_company_or_platform(url: str, text: str) -> bool:
-    t = (text or "").lower()
-    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced","program management","affiliate management"))
-    has_ig  = any(k in t for k in ("igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker","poker","slots"))
-    if not (has_aff and has_ig): return False
-    has_company = any(k in t for k in COMPANY_SERVICE_HINTS)
-    if not has_company: return False
-    if is_network_for_publishers(t): return False
-    return True
-
-# --- B2C шум (промо / турниры / бонусы без услуг для операторов) ---
-B2C_NOISE = ("tournament","prize drop","drops","free spins","bonus terms","bonus", "€","$","₴","₸")
-def looks_like_b2c_promo(text: str) -> bool:
-    t = (text or "").lower()
-    if any(k in t for k in B2C_NOISE):
-        if ("services" not in t and "solutions" not in t and "management" not in t and "for operators" not in t):
-            return True
-    return False
-
-def classify(url: str, text: str) -> str:
+def _prefilter_url(url: str, text: str) -> Optional[str]:
     if looks_like_job(url, text): return "jobs"
     if looks_like_event(url, text): return "event"
     if looks_like_directory(url, text): return "directory"
     if looks_like_blog(url, text): return "blog"
+    if is_network_for_publishers(text): return "network_for_publishers"
     if is_operator_program(url, text): return "operator_program"
-    if is_company_or_platform(url, text): return "company_or_platform"
-    return "junk"
+    return None
 
-def language_ok(text: str, region: str) -> bool:
-    allowed = REGION_LANG_ALLOW.get(REGION_ALIAS.get(region, region), REGION_LANG_ALLOW["wt-wt"])
-    lang = guess_lang(text)
-    return lang in allowed
+def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level: int = 0) -> List[Dict[str,Any]]:
+    """
+    relax_level:
+      0 — строгий режим (EN допускается по region rules)
+      1 — язык гибче (EN всегда ок), мягче региональные сигналы, включаем микрокраул
+      2 — допускаем «почти компания» (affiliate+igaming без явных services)
+    """
+    global CURRENT_SCRAPE_DEADLINE_TS, ALLOW_MICROCRAWL
 
-def quality_score(url: str, text: str) -> float:
-    t = (text or "").lower()
-    score = 0.0
-    if url.lower().startswith("https://"): score += 0.06
-    for k in ("about","contact","services","solutions","platform","features","pricing","clients","case"):
-        if k in t: score += 0.02
-    if re.search(r"20(2[3-6])", t): score += 0.05
-    return min(score, 0.4)
+    results: List[Dict[str,Any]] = []
 
-def agency_boost(text: str) -> float:
-    t = (text or "").lower()
-    boost = 0.0
-    if "agency" in t or "агентств" in t or "opm" in t or "program management" in t: boost += 0.12
-    if "for operators" in t or "for brands" in t or "for advertisers" in t: boost += 0.08
-    if "platform" in t and "features" in t and "pricing" in t: boost -= 0.05
-    if "affiliate network" in t or is_network_for_publishers(t): boost -= 0.25
-    return max(-0.3, min(0.2, boost))
+    # ограничение дублей по домену
+    per_host_counter: Dict[str,int] = {}
+    filtered_urls = []
+    for u in urls:
+        dom = domain_of(u)
+        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom):
+            continue
+        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT:
+            continue
+        per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
+        filtered_urls.append(u)
 
-def region_affinity_quick(url: str, t_low: str, region: str) -> float:
-    reg_key = REGION_ALIAS.get(region, region)
-    reg = REGION_MAP.get(reg_key, REGION_MAP["wt-wt"]); tld = "." + reg["tld"] if reg.get("tld") else ""
-    u = url.lower(); score = 0.0
-    if tld and u.endswith(tld): score += 0.5
-    toks = [x.lower() for x in REGION_HINTS.get(reg_key, {}).get("tokens", [])]
-    if toks and any(tok in t_low for tok in toks): score += 0.2
-    return max(0.0, min(1.0, score))
+    start_ts = time.time()
+    CURRENT_SCRAPE_DEADLINE_TS = start_ts + SCRAPE_HARD_DEADLINE_SEC
+    ALLOW_MICROCRAWL = (relax_level >= 1)
 
-def region_affinity(url: str, text: str, region: str) -> float:
-    reg_key = REGION_ALIAS.get(region, region)
-    reg = REGION_MAP.get(reg_key, REGION_MAP["wt-wt"]); tld = "." + reg["tld"] if reg.get("tld") else ""
-    u = url.lower(); t = (text or "").lower(); score = 0.0
-    if tld and u.endswith(tld): score += 0.55
-    hints = REGION_HINTS.get(reg_key, {})
-    tokens = [x.lower() for x in hints.get("tokens", [])]
-    orgs = [x.lower() for x in hints.get("org", [])]
-    cities = [x.lower() for x in hints.get("cities", [])]
-    if tokens and any(tok in t for tok in tokens): score += 0.25
-    if orgs and any(o in t for o in orgs): score += 0.20
-    if cities and any(c in t for c in cities): score += 0.15
-    rex = PHONE_CODE_RE.get(reg_key);  cur = CURRENCY_HINTS.get(reg_key)
-    if rex and rex.search(t): score += 0.30
-    if cur and any(sym.lower() in t for sym in [c.lower() for c in cur[0]]): score += cur[1]
-    if language_ok(t, reg_key): score += 0.15
-    else: score -= 0.30
-    if tld and (not u.endswith(tld)) and not (tokens and any(tok in t for tok in tokens)): score -= 0.25
-    return max(0.0, min(1.0, score))
+    def passes_language(txt: str) -> bool:
+        if relax_level == 0:
+            return language_ok(txt, region)
+        try:
+            lang = guess_lang(txt)
+        except Exception:
+            lang = "en"
+        allowed = set(REGION_LANG_ALLOW.get(REGION_ALIAS.get(region, region), ())) | {"en"}
+        return lang in allowed
 
-def base_relevance(text: str) -> float:
-    t = (text or "").lower(); rel = 0.0
-    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced","program management","affiliate management")): rel += 0.45
-    if any(k in t for k in ("igaming","casino","беттинг","sportsbook","bookmaker","poker","slots","gambling")): rel += 0.4
-    if any(k in t for k in ("for operators","for brands","for advertisers","clients","case study","platform","services","solutions")): rel += 0.25
-    return max(0.0, min(1.0, rel))
+    with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
+        fut2url = {ex.submit(fetch_one, u, region, ALLOW_MICROCRAWL): u for u in filtered_urls}
+        for fut in as_completed(fut2url):
+            now = time.time()
+            if now > CURRENT_SCRAPE_DEADLINE_TS:
+                logger.warning("Scrape deadline reached, stopping further processing")
+                break
 
-def score_item(url: str, text: str, region: str, jitter_seed: int) -> float:
-    d = domain_of(url)
-    base = 0.85*base_relevance(text) + 1.1*region_affinity(url, text, region) + quality_score(url, text) \
-           + domain_feedback_adjustment(d) + agency_boost(text)
-    if any(url.lower().endswith(ct) for ct in CASINO_TLDS): base -= 0.2
-    rnd = random.Random(hash(d + str(jitter_seed)) & 0xffffffff).uniform(-0.06, 0.06)
-    score = base + rnd
-    return max(0.0, min(2.2, score))
+            item = fut.result()
+            if not item:
+                continue
 
-# ======================= Persistence =======================
+            url = item["url"]; name = item["name"]; text = item["text"]
+
+            # Предфильтры мусора
+            if _prefilter_url(url, text):
+                continue
+            if looks_like_b2c_promo(text):
+                continue
+
+            # Строгая проверка company/services; в relax=2 допускаем «почти компания»
+            if relax_level < 2 and not is_company_or_platform(url, text):
+                continue
+            if relax_level >= 2:
+                t = (text or "").lower()
+                if not (("affiliate" in t or "affiliat" in t or "партнерск" in t) and ("igaming" in t or "casino" in t or "казино" in t)):
+                    continue
+
+            if not passes_language(text):
+                continue
+
+            score = score_item(url, text, region, jitter_seed)
+            results.append({
+                "id": str(uuid.uuid4()),
+                "name": name or "N/A",
+                "website": url,
+                "description": short(text, 400),
+                "country": "N/A",
+                "source": "Web",
+                "score": score
+            })
+
+            # Ранняя остановка: в строгой фазе набрали минимум — выходим
+            if relax_level == 0 and len(results) >= MIN_RESULTS:
+                logger.info("Strict phase reached MIN_RESULTS — early exit")
+                break
+
+    # Дедуп по домену
+    by_domain: Dict[str, List[Dict[str,Any]]] = {}
+    for r in results:
+        d = domain_of(r["website"])
+        by_domain.setdefault(d, []).append(r)
+
+    compact: List[Dict[str,Any]] = []
+    for d, items in by_domain.items():
+        items.sort(key=lambda x: x["score"], reverse=True)
+        keep = [items[0]]
+        if len(items) > 1 and (items[0]["score"] - items[1]["score"] > 0.35):
+            keep.append(items[1])
+        compact.extend(keep)
+
+    compact.sort(key=lambda x: x["score"], reverse=True)
+    return compact
+
+# ======================= Seeds (affcatalog) =======================
+def harvest_affcatalog(user_prompt: str, region: str, limit: int = 5) -> List[Dict[str, Any]]:
+    results = []
+    try:
+        base = "https://affcatalog.com/ru/"
+        # robots
+        if not robots_allowed(base, DEFAULT_UA):
+            return results
+        resp = requests.get(base, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
+        if not resp or resp.status_code >= 400: return results
+        soup = BeautifulSoup(resp.text, "lxml")
+        links = []
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            txt = (a.get_text(" ", strip=True) or "")[:200]
+            if not href: continue
+            href_low = href.lower()
+            if any(key in href_low for key in ("/partner", "/partners", "/affiliat", "/program")) \
+               or "партнер" in txt.lower() or "партнёр" in txt.lower():
+                links.append(urljoin(base, href))
+            if len(links) >= 120:
+                break
+        seen_domains = set()
+        for u in links:
+            try:
+                if domain_is_blocked(domain_of(u)):
+                    continue
+                r2 = _http_get(u)
+                if not r2: continue
+                title, text, _ = extract_text_for_classification(r2.content)
+                if not text: continue
+                if classify_kind(u, text) not in ("company_or_platform",):  # жёсткий фильтр
+                    continue
+                d = domain_of(u)
+                if d in seen_domains: continue
+                seen_domains.add(d)
+                results.append({
+                    "id": str(uuid.uuid4()),
+                    "name": title or "Affiliate partner",
+                    "website": u,
+                    "description": short(text, 400),
+                    "country": "N/A",
+                    "source": "Seed",
+                    "score": 0.65
+                })
+                if len(results) >= limit:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    logger.info(f"Harvested from directory seeds: {len(results)}")
+    return results
+
+# ======================= Query building & URL collection =======================
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
+    region = REGION_ALIAS.get(region, region)
+    if region not in REGION_MAP:
+        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
+        region = "wt-wt"
+    intent = detect_intent(user_prompt)
+    base_queries = build_core_queries(user_prompt)
+    queries = apply_geo_bias(base_queries, region)
+    queries = [with_intent_filters(q, intent) for q in queries]
+    return queries, base_queries, region, intent
+
+def collect_urls(web_queries: List[str], base_queries: List[str], region: str, engine: str, per_query_k: int) -> List[str]:
+    all_urls: List[str] = []
+    # Wave 1 — DDG основной
+    for q in web_queries:
+        all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region))
+    logger.info(f"Wave1 URLs: {len(all_urls)}")
+
+    # Wave 2 — те же базовые запросы без site:.tld, но с country tokens (если есть)
+    geo_soft = apply_geo_bias(base_queries, region)
+    geo_soft = [q for i, q in enumerate(geo_soft) if i not in (1, 2)]
+    more_ddg = []
+    for q in geo_soft:
+        more_ddg.extend(duckduckgo_search(with_intent_filters(q, detect_intent(q)), max_results=per_query_k, region=region))
+    merged = list(dict.fromkeys([normalize_url(u) for u in (all_urls + more_ddg) if not is_hard_bad_domain(domain_of(u))]))
+    logger.info(f"Wave2 URLs add: {len(more_ddg)}, merged: {len(merged)}")
+
+    # Wave 3 — SerpAPI fallback
+    serp_urls = []
+    if (engine in ("serpapi","both")) and SERPAPI_API_KEY and (len(merged) < MIN_RESULTS * 6):
+        for q in web_queries:
+            serp_urls.extend(serpapi_search(q, max_results=per_query_k, region=region))
+            if len(serp_urls) > MAX_RESULTS * 10:
+                break
+    if serp_urls:
+        merged = list(dict.fromkeys(merged + serp_urls))
+    logger.info(f"SerpAPI fallback URLs: {len(serp_urls)}")
+    return merged
+
+# ======================= Persistence & export =======================
 def insert_query_record(text: str, intent: Dict[str,bool], region: str) -> str:
     qid = str(uuid.uuid4())
     try:
@@ -878,209 +1224,22 @@ def save_to_csv_txt():
     except Exception as e:
         logger.error(f"Export failed: {e}")
 
-# ======================= URL harvesting (multi-wave) =======================
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
-    region = REGION_ALIAS.get(region, region)
-    if region not in REGION_MAP:
-        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
-        region = "wt-wt"
-    intent = detect_intent(user_prompt)
-    base_queries = build_core_queries(user_prompt)
-    queries = apply_geo_bias(base_queries, region)
-    queries = [with_intent_filters(q, intent) for q in queries]
-    return queries, base_queries, region, intent
-
-def collect_urls(web_queries: List[str], base_queries: List[str], region: str, engine: str, per_query_k: int) -> List[str]:
-    all_urls: List[str] = []
-    # Wave 1 — DDG основной
-    for q in web_queries:
-        all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region))
-    logger.info(f"Wave1 URLs: {len(all_urls)}")
-
-    # Wave 2 — те же базовые запросы без site:.tld, но с country tokens (если есть)
-    geo_soft = apply_geo_bias(base_queries, region)
-    geo_soft = [q for i, q in enumerate(geo_soft) if i not in (1, 2)]  # убрать site: тлд
-    more_ddg = []
-    for q in geo_soft:
-        more_ddg.extend(duckduckgo_search(with_intent_filters(q, detect_intent(q)), max_results=per_query_k, region=region))
-    merged = list(dict.fromkeys([normalize_url(u) for u in (all_urls + more_ddg) if not is_hard_bad_domain(domain_of(u))]))
-    logger.info(f"Wave2 URLs add: {len(more_ddg)}, merged: {len(merged)}")
-
-    # Wave 3 — SerpAPI fallback
-    serp_urls = []
-    if (engine in ("serpapi","both")) and SERPAPI_API_KEY and (len(merged) < MIN_RESULTS * 6):
-        for q in web_queries:
-            serp_urls.extend(serpapi_search(q, max_results=per_query_k, region=region))
-            if len(serp_urls) > MAX_RESULTS * 10:
-                break
-    if serp_urls:
-        merged = list(dict.fromkeys(merged + serp_urls))
-    logger.info(f"SerpAPI fallback URLs: {len(serp_urls)}")
-    return merged
-
-# ======================= Directory (affcatalog.com) =======================
-def harvest_affcatalog(user_prompt: str, region: str, limit: int = 5) -> List[Dict[str, Any]]:
-    results = []
-    try:
-        base = "https://affcatalog.com/ru/"
-        resp = requests.get(base, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
-        if not resp or resp.status_code >= 400: return results
-        soup = BeautifulSoup(resp.text, "lxml")
-        links = []
-        for a in soup.select("a[href]"):
-            href = a.get("href") or ""
-            txt = (a.get_text(" ", strip=True) or "")[:200]
-            if not href: continue
-            href_low = href.lower()
-            if any(key in href_low for key in ("/partner", "/partners", "/affiliat", "/program")) \
-               or "партнер" in txt.lower() or "партнёр" in txt.lower():
-                links.append(urljoin(base, href))
-            if len(links) >= 80:
-                break
-        seen_domains = set()
-        for u in links:
-            try:
-                r2 = _http_get(u)
-                if not r2: continue
-                title, text, _ = extract_text_for_classification(r2.content)
-                d = domain_of(u)
-                if d in seen_domains: continue
-                seen_domains.add(d)
-                results.append({
-                    "id": str(uuid.uuid4()),
-                    "name": title or "Affiliate program",
-                    "website": u,
-                    "description": short(text, 400),
-                    "country": "N/A",
-                    "source": "Directory: Affcatalog",
-                    "score": 0.65
-                })
-                if len(results) >= limit:
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-    logger.info(f"Harvested from directories: {len(results)}")
-    return results
-
-# ======================= Scrape & Rank =======================
-def _prefilter_url(url: str, text: str) -> Optional[str]:
-    if looks_like_job(url, text): return "jobs"
-    if looks_like_event(url, text): return "event"
-    if looks_like_directory(url, text): return "directory"
-    if looks_like_blog(url, text): return "blog"
-    if is_network_for_publishers(text): return "network_for_publishers"
-    if is_operator_program(url, text): return "operator_program"
-    return None
-
-def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level: int = 0) -> List[Dict[str,Any]]:
-    """
-    relax_level:
-      0 — строгий режим (EN допускается по region rules)
-      1 — язык гибче (EN всегда ок), чуть мягче региональные сигналы
-      2 — допускаем «почти компания» (affiliate+igaming без явных services)
-    """
-    global CURRENT_SCRAPE_DEADLINE_TS, ALLOW_MICROCRAWL
-
-    results: List[Dict[str,Any]] = []
-
-    # ограничение дублей по домену
-    per_host_counter: Dict[str,int] = {}
-    filtered_urls = []
-    for u in urls:
-        dom = domain_of(u)
-        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom):
-            continue
-        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT:
-            continue
-        per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
-        filtered_urls.append(u)
-
-    start_ts = time.time()
-    CURRENT_SCRAPE_DEADLINE_TS = start_ts + SCRAPE_HARD_DEADLINE_SEC
-    # микрокраул включаем только в релакс-фазах
-    ALLOW_MICROCRAWL = (relax_level >= 1)
-
-    def passes_language(txt: str) -> bool:
-        if relax_level == 0:
-            return language_ok(txt, region)
+def save_to_db_and_files(web_results: List[Dict[str, Any]], intent: Dict[str, bool], region: str, query_id: str):
+    for row in web_results:
         try:
-            lang = guess_lang(txt)
-        except Exception:
-            lang = "en"
-        allowed = set(REGION_LANG_ALLOW.get(REGION_ALIAS.get(region, region), ())) | {"en"}
-        return lang in allowed
+            save_result_records(row, intent, region, query_id)
+        except Exception as e:
+            logger.error(f"Failed to persist row {row.get('website')}: {e}")
+    try:
+        save_to_csv_txt()
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut2url = {ex.submit(fetch_one, u, region): u for u in filtered_urls}
-        for fut in as_completed(fut2url):
-            now = time.time()
-            if now > CURRENT_SCRAPE_DEADLINE_TS:
-                logger.warning("Scrape deadline reached, stopping further processing")
-                break
-
-            item = fut.result()
-            if not item:
-                continue
-
-            url = item["url"]; name = item["name"]; text = item["text"]
-
-            # Предфильтры мусора
-            if _prefilter_url(url, text):
-                continue
-            if looks_like_b2c_promo(text):
-                continue
-
-            # Строгая проверка company/services; в relax=2 допускаем «почти компания»
-            if relax_level < 2 and not is_company_or_platform(url, text):
-                continue
-            if relax_level >= 2:
-                t = (text or "").lower()
-                if not (("affiliate" in t or "affiliat" in t or "партнерск" in t) and ("igaming" in t or "casino" in t or "казино" in t)):
-                    continue
-
-            if not passes_language(text):
-                continue
-
-            score = score_item(url, text, region, jitter_seed)
-            results.append({
-                "id": str(uuid.uuid4()),
-                "name": name or "N/A",
-                "website": url,
-                "description": short(text, 400),
-                "country": "N/A",
-                "source": "Web",
-                "score": score
-            })
-
-            # Ранняя остановка: в строгой фазе набрали минимум — выходим
-            if relax_level == 0 and len(results) >= MIN_RESULTS:
-                logger.info("Strict phase reached MIN_RESULTS — early exit")
-                break
-
-    # Дедуп по домену: 1–2 записи
-    by_domain: Dict[str, List[Dict[str,Any]]] = {}
-    for r in results:
-        d = domain_of(r["website"])
-        by_domain.setdefault(d, []).append(r)
-
-    compact: List[Dict[str,Any]] = []
-    for d, items in by_domain.items():
-        items.sort(key=lambda x: x["score"], reverse=True)
-        keep = [items[0]]
-        if len(items) > 1 and (items[0]["score"] - items[1]["score"] > 0.35):
-            keep.append(items[1])
-        compact.extend(keep)
-
-    compact.sort(key=lambda x: x["score"], reverse=True)
-    return compact
-
-def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jitter_seed: int, user_prompt: str) -> List[Dict[str,Any]]:
+# ======================= Floor & Blend =======================
+def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jitter_seed: int) -> List[Dict[str,Any]]:
     if len(results) >= MIN_RESULTS:
         return results[:MAX_RESULTS]
 
-    need = MAX_RESULTS - len(results)
     more = scrape_parallel(urls[:600], region, jitter_seed, relax_level=1)
     known = set(r["website"] for r in results)
     for r in more:
@@ -1101,20 +1260,9 @@ def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jit
 
     return results[:MAX_RESULTS]
 
-def save_to_db_and_files(web_results: List[Dict[str, Any]], intent: Dict[str, bool], region: str, query_id: str):
-    # Сохраняем в БД историю и текущие результаты
-    for row in web_results:
-        try:
-            save_result_records(row, intent, region, query_id)
-        except Exception as e:
-            logger.error(f"Failed to persist row {row.get('website')}: {e}")
-    # Экспортируем CSV/TXT
-    try:
-        save_to_csv_txt()
-    except Exception as e:
-        logger.error(f"Export failed: {e}")
 # ======================= API =======================
 @app.route("/search", methods=["POST", "OPTIONS"])
+@app.route("/api/search", methods=["POST", "OPTIONS"])  # алиас, не ломает FE
 def search():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -1124,38 +1272,38 @@ def search():
         region_in = data.get("region", "wt-wt")
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE","ddg")).lower()
         per_query_k = int(data.get("per_query", 25))
+        user_id = (data.get("user_id") or "").strip()  # опционально
 
         if not user_query:
             return jsonify({"error":"Query is required"}), 400
 
-        region = REGION_ALIAS.get(region_in, region_in)
-        logger.info(f"API request: query='{user_query}', region={region}, engine={engine}")
-
+        # очистка текущей витрины результатов (не истории)
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute("DELETE FROM results")
             conn.commit()
 
-        web_queries, base_queries, region, intent = generate_search_queries(user_query, region)
+        web_queries, base_queries, region, intent = generate_search_queries(user_query, region_in)
         query_id = insert_query_record(user_query, intent, region)
-
         jitter_seed = int(uuid.UUID(query_id)) & 0xffffffff
 
+        # общий дедлайн пайплайна
+        t0 = time.time()
         urls = collect_urls(web_queries, base_queries, region, engine, per_query_k=per_query_k)
 
-        # основной скрап
-        t0 = time.time()
         # основной скрап — строгая фаза
         web_results = scrape_parallel(urls[:400], region, jitter_seed, relax_level=0)
 
         # добиваем минимум 25
-        web_results = ensure_floor(web_results, urls, region, jitter_seed, user_query)
-        # аккуратно подмешиваем 2–5 из каталога, если есть место
+        web_results = ensure_floor(web_results, urls, region, jitter_seed)
+
+        # аккуратно подмешиваем 2–5 из каталога (если есть место)
         mix_slots = max(0, min(5, MAX_RESULTS - len(web_results)))
         if mix_slots > 0:
             mix = harvest_affcatalog(user_query, region, limit=mix_slots)
             web_results.extend(mix)
 
+        # финальный ранж, обрезка
         web_results.sort(key=lambda x: x["score"], reverse=True)
         web_results = web_results[:MAX_RESULTS]
 
@@ -1164,18 +1312,25 @@ def search():
 
         save_to_db_and_files(web_results, intent, region, query_id)
 
+        # Ответ строго совместим: results[], region, engine, query_id, took_sec
         return jsonify({
             "results": web_results,
             "region": region,
             "engine": engine,
             "query_id": query_id,
-            "took_sec": round(dt,2)
+            "took_sec": round(dt,2),
+            "meta": {
+                "min_results": MIN_RESULTS,
+                "max_results": MAX_RESULTS,
+                "cache_ttl_s": CACHE_TTL_S
+            }
         })
     except Exception as e:
         logger.error(f"/search error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/feedback", methods=["POST", "OPTIONS"])
+@app.route("/api/feedback", methods=["POST", "OPTIONS"])  # алиас
 def feedback():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -1184,6 +1339,7 @@ def feedback():
         query_id = (data.get("query_id") or "").strip()
         url = (data.get("url") or "").strip()
         raw_action = (data.get("action") or "").strip().lower()
+        user_id = (data.get("user_id") or "").strip()
         action = "bad" if raw_action == "flag" else raw_action
         if not (query_id and url and action in {"click","good","bad"}):
             return jsonify({"error":"query_id, url, action(click|good|bad|flag) required"}), 400
@@ -1191,9 +1347,9 @@ def feedback():
         dom = domain_of(url)
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("""INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                      (str(uuid.uuid4()), query_id, url, dom, action, weight, datetime.utcnow().isoformat()))
+            c.execute("""INSERT INTO interactions (id, query_id, url, domain, action, weight, user_id, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (str(uuid.uuid4()), query_id, url, dom, action, weight, user_id, datetime.utcnow().isoformat()))
             conn.commit()
         if action == "bad":
             _block_domain(dom, reason="user_bad", days=BAD_BLOCK_DAYS)
@@ -1215,7 +1371,7 @@ def download_file(filetype):
     except Exception as e:
         return jsonify({"error": f"Error downloading {filename}: {str(e)}"}), 500
 
-# ========= SPA =========
+# ========= SPA (оставлено для совместимости) =========
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
@@ -1230,8 +1386,5 @@ def serve_frontend(path):
 # ========= Entry =========
 if __name__ == "__main__":
     init_db()
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", os.getenv("RAILWAY_PORT", "8080")))
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    logger.info(f"Starting Flask on http://{host}:{port} (debug={debug})")
-    app.run(host=host, port=port, debug=debug, use_reloader=False)
+    logger.info(f"Starting Flask on http://{HOST}:{PORT} (debug={FLASK_DEBUG})")
+    app.run(host=HOST, port=PORT, debug=FLASK_DEBUG, use_reloader=False)
