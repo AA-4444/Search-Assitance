@@ -71,6 +71,8 @@ SERPAPI_RATE_LIMIT_RPS = float(os.getenv("SERPAPI_RATE_LIMIT_RPS", "0.8"))
 FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", str(MAX_WORKERS)))
 CACHE_TTL_S = int(os.getenv("CACHE_TTL_S", "7200"))
 SEED_REFRESH_H = int(os.getenv("SEED_REFRESH_H", "24"))
+# общий бюджет времени на один поиск (сек)
+PIPELINE_DEADLINE_SEC = int(os.getenv("PIPELINE_DEADLINE_SEC", "150"))
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", os.getenv("RAILWAY_PORT", "8080")))
@@ -971,12 +973,9 @@ def _prefilter_url(url: str, text: str) -> Optional[str]:
     if is_operator_program(url, text): return "operator_program"
     return None
 
-def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level: int = 0) -> List[Dict[str,Any]]:
+def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level: int = 0, deadline_ts: Optional[float]=None) -> List[Dict[str,Any]]:
     """
-    relax_level:
-      0 — строгий режим (EN допускается по region rules)
-      1 — язык гибче (EN всегда ок), мягче региональные сигналы, включаем микрокраул
-      2 — допускаем «почти компания» (affiliate+igaming без явных services)
+    deadline_ts: абсолютное unix-время окончания пайплайна (общий бюджет).
     """
     global CURRENT_SCRAPE_DEADLINE_TS, ALLOW_MICROCRAWL
 
@@ -994,8 +993,10 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
         per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
         filtered_urls.append(u)
 
-    start_ts = time.time()
-    CURRENT_SCRAPE_DEADLINE_TS = start_ts + SCRAPE_HARD_DEADLINE_SEC
+    # НЕ сбрасываем дедлайн на фазу, используем общий deadline_ts
+    if deadline_ts is None:
+        deadline_ts = time.time() + SCRAPE_HARD_DEADLINE_SEC  # запасной вариант
+    CURRENT_SCRAPE_DEADLINE_TS = deadline_ts
     ALLOW_MICROCRAWL = (relax_level >= 1)
 
     def passes_language(txt: str) -> bool:
@@ -1009,36 +1010,25 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
         return lang in allowed
 
     with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as ex:
-        fut2url = {ex.submit(fetch_one, u, region, ALLOW_MICROCRAWL): u for u in filtered_urls}
+        # ограничим объём: 250 в strict, 350 в relax
+        fut2url = {ex.submit(fetch_one, u, region, ALLOW_MICROCRAWL): u for u in filtered_urls[: (250 if relax_level==0 else 350)]}
         for fut in as_completed(fut2url):
             now = time.time()
-            if now > CURRENT_SCRAPE_DEADLINE_TS:
-                logger.warning("Scrape deadline reached, stopping further processing")
+            if now > deadline_ts:
+                logger.warning("Global pipeline deadline reached — stopping scrape")
                 break
-
             item = fut.result()
             if not item:
                 continue
-
             url = item["url"]; name = item["name"]; text = item["text"]
-
-            # Предфильтры мусора
-            if _prefilter_url(url, text):
-                continue
-            if looks_like_b2c_promo(text):
-                continue
-
-            # Строгая проверка company/services; в relax=2 допускаем «почти компания»
-            if relax_level < 2 and not is_company_or_platform(url, text):
-                continue
+            if _prefilter_url(url, text): continue
+            if looks_like_b2c_promo(text): continue
+            if relax_level < 2 and not is_company_or_platform(url, text): continue
             if relax_level >= 2:
                 t = (text or "").lower()
                 if not (("affiliate" in t or "affiliat" in t or "партнерск" in t) and ("igaming" in t or "casino" in t or "казино" in t)):
                     continue
-
-            if not passes_language(text):
-                continue
-
+            if not passes_language(text): continue
             score = score_item(url, text, region, jitter_seed)
             results.append({
                 "id": str(uuid.uuid4()),
@@ -1049,18 +1039,15 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
                 "source": "Web",
                 "score": score
             })
-
-            # Ранняя остановка: в строгой фазе набрали минимум — выходим
             if relax_level == 0 and len(results) >= MIN_RESULTS:
                 logger.info("Strict phase reached MIN_RESULTS — early exit")
                 break
 
-    # Дедуп по домену
+    # дедуп (как было)
     by_domain: Dict[str, List[Dict[str,Any]]] = {}
     for r in results:
         d = domain_of(r["website"])
         by_domain.setdefault(d, []).append(r)
-
     compact: List[Dict[str,Any]] = []
     for d, items in by_domain.items():
         items.sort(key=lambda x: x["score"], reverse=True)
@@ -1068,7 +1055,6 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
         if len(items) > 1 and (items[0]["score"] - items[1]["score"] > 0.35):
             keep.append(items[1])
         compact.extend(keep)
-
     compact.sort(key=lambda x: x["score"], reverse=True)
     return compact
 
@@ -1236,27 +1222,32 @@ def save_to_db_and_files(web_results: List[Dict[str, Any]], intent: Dict[str, bo
         logger.error(f"Export failed: {e}")
 
 # ======================= Floor & Blend =======================
-def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jitter_seed: int) -> List[Dict[str,Any]]:
-    if len(results) >= MIN_RESULTS:
+def ensure_floor(results: List[Dict[str,Any]], urls: List[str], region: str, jitter_seed: int, deadline_ts: float) -> List[Dict[str,Any]]:
+    if len(results) >= MIN_RESULTS or time.time() >= deadline_ts:
         return results[:MAX_RESULTS]
 
-    more = scrape_parallel(urls[:600], region, jitter_seed, relax_level=1)
-    known = set(r["website"] for r in results)
-    for r in more:
-        if r["website"] not in known:
-            results.append(r); known.add(r["website"])
-        if len(results) >= MAX_RESULTS:
-            break
+    # relax=1 — ограничиваем объём и уважаем дедлайн
+    if time.time() < deadline_ts - 30:
+        more = scrape_parallel(urls[:350], region, jitter_seed, relax_level=1, deadline_ts=deadline_ts)
+        known = set(r["website"] for r in results)
+        for r in more:
+            if r["website"] not in known:
+                results.append(r); known.add(r["website"])
+            if len(results) >= MAX_RESULTS or time.time() >= deadline_ts:
+                break
 
-    if len(results) >= MIN_RESULTS:
+    if len(results) >= MIN_RESULTS or time.time() >= deadline_ts:
         return results[:MAX_RESULTS]
 
-    more2 = scrape_parallel(urls[600:1200], region, jitter_seed, relax_level=2)
-    for r in more2:
-        if r["website"] not in known:
-            results.append(r); known.add(r["website"])
-        if len(results) >= MAX_RESULTS:
-            break
+    # relax=2 — только если остаётся запас времени
+    if time.time() < deadline_ts - 45:
+        more2 = scrape_parallel(urls[350:800], region, jitter_seed, relax_level=2, deadline_ts=deadline_ts)
+        known = set(r["website"] for r in results)
+        for r in more2:
+            if r["website"] not in known:
+                results.append(r); known.add(r["website"])
+            if len(results) >= MAX_RESULTS or time.time() >= deadline_ts:
+                break
 
     return results[:MAX_RESULTS]
 
@@ -1287,15 +1278,16 @@ def search():
         query_id = insert_query_record(user_query, intent, region)
         jitter_seed = int(uuid.UUID(query_id)) & 0xffffffff
 
-        # общий дедлайн пайплайна
         t0 = time.time()
+        deadline_ts = t0 + float(os.getenv("PIPELINE_DEADLINE_SEC", "150"))
+
         urls = collect_urls(web_queries, base_queries, region, engine, per_query_k=per_query_k)
 
-        # основной скрап — строгая фаза
-        web_results = scrape_parallel(urls[:400], region, jitter_seed, relax_level=0)
+        # строгая фаза (урезано до 250 и с глобальным дедлайном)
+        web_results = scrape_parallel(urls[:250], region, jitter_seed, relax_level=0, deadline_ts=deadline_ts)
 
-        # добиваем минимум 25
-        web_results = ensure_floor(web_results, urls, region, jitter_seed)
+        # добиваем минимум 25, передаём общий дедлайн
+        web_results = ensure_floor(web_results, urls, region, jitter_seed, deadline_ts=deadline_ts)
 
         # аккуратно подмешиваем 2–5 из каталога (если есть место)
         mix_slots = max(0, min(5, MAX_RESULTS - len(web_results)))
