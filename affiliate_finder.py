@@ -723,10 +723,7 @@ def is_company_or_platform(url: str, text: str) -> bool:
     if is_network_for_publishers(t): return False
     return True
 
-def looks_like_job(url: str, text: str) -> bool  # (already above)  # noqa
-def looks_like_event(url: str, text: str) -> bool  # noqa
-def looks_like_directory(url: str, text: str) -> bool  # noqa
-def looks_like_blog(url: str, text: str) -> bool  # noqa
+
 
 def classify(url: str, text: str) -> str:
     if looks_like_job(url, text): return "jobs"
