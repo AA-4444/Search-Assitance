@@ -52,7 +52,13 @@ DEFAULT_UA = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
+# --- runtime guards for time-bounded scraping ---
+CURRENT_SCRAPE_DEADLINE_TS: float = 0.0
+ALLOW_MICROCRAWL: bool = False
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "7"))  # было 9
+SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "300"))  # было 180
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))  # было 16
 # SerpAPI — резерв + cooldown при 429
 SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 минут
 _last_serpapi_429_at = 0.0
@@ -684,15 +690,19 @@ def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
             return None
 
         # микрокраул — строго при необходимости
-        need_more_region = region_affinity_quick(url, t_low, region) < 0.6
-        need_company = not is_company_or_platform(url, t_low)
+             # микрокраул — только в релакс-фазах и если остаётся запас времени
         extras_text = ""
-        if ENABLE_MICROCRAWL and (need_more_region or need_company):
-            for ex_url in pick_microcrawl_targets(url, links):
-                ex_resp = _http_get(ex_url)
-                if not ex_resp: continue
-                _, ex_text, _ = extract_text_for_classification(ex_resp.content)
-                if ex_text: extras_text += " " + short(ex_text, 1500)
+        if ENABLE_MICROCRAWL and ALLOW_MICROCRAWL and (time.time() < CURRENT_SCRAPE_DEADLINE_TS - 20):
+            if need_more_region or need_company:
+                for ex_url in pick_microcrawl_targets(url, links):
+                    if time.time() >= CURRENT_SCRAPE_DEADLINE_TS - 10:
+                        break
+                    ex_resp = _http_get(ex_url)
+                    if not ex_resp:
+                        continue
+                    _, ex_text, _ = extract_text_for_classification(ex_resp.content)
+                    if ex_text:
+                        extras_text += " " + short(ex_text, 1200)
 
         full_text = (text + " " + extras_text).strip()
         return {"url": url, "name": title or "N/A", "text": full_text}
@@ -967,22 +977,30 @@ def _prefilter_url(url: str, text: str) -> Optional[str]:
 def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level: int = 0) -> List[Dict[str,Any]]:
     """
     relax_level:
-      0 — строгий режим
-      1 — язык гибче: допускаем en всегда + ослабляем region_affinity штраф (через passes_language)
-      2 — допускаем "почти компания" (affiliate+igaming, без явных services)
+      0 — строгий режим (EN допускается по region rules)
+      1 — язык гибче (EN всегда ок), чуть мягче региональные сигналы
+      2 — допускаем «почти компания» (affiliate+igaming без явных services)
     """
+    global CURRENT_SCRAPE_DEADLINE_TS, ALLOW_MICROCRAWL
+
     results: List[Dict[str,Any]] = []
 
+    # ограничение дублей по домену
     per_host_counter: Dict[str,int] = {}
     filtered_urls = []
     for u in urls:
         dom = domain_of(u)
-        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom): continue
-        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT: continue
+        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom):
+            continue
+        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT:
+            continue
         per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
         filtered_urls.append(u)
 
     start_ts = time.time()
+    CURRENT_SCRAPE_DEADLINE_TS = start_ts + SCRAPE_HARD_DEADLINE_SEC
+    # микрокраул включаем только в релакс-фазах
+    ALLOW_MICROCRAWL = (relax_level >= 1)
 
     def passes_language(txt: str) -> bool:
         if relax_level == 0:
@@ -997,21 +1015,24 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fut2url = {ex.submit(fetch_one, u, region): u for u in filtered_urls}
         for fut in as_completed(fut2url):
-            if (time.time() - start_ts) > SCRAPE_HARD_DEADLINE_SEC:
+            now = time.time()
+            if now > CURRENT_SCRAPE_DEADLINE_TS:
                 logger.warning("Scrape deadline reached, stopping further processing")
                 break
-            item = fut.result()
-            if not item: continue
-            url = item["url"]; name = item["name"]; text = item["text"]
 
-            bad_reason = _prefilter_url(url, text)
-            if bad_reason:
+            item = fut.result()
+            if not item:
                 continue
 
+            url = item["url"]; name = item["name"]; text = item["text"]
+
+            # Предфильтры мусора
+            if _prefilter_url(url, text):
+                continue
             if looks_like_b2c_promo(text):
                 continue
 
-            # строгая проверка company/services; на relax=2 позволяем "почти компания"
+            # Строгая проверка company/services; в relax=2 допускаем «почти компания»
             if relax_level < 2 and not is_company_or_platform(url, text):
                 continue
             if relax_level >= 2:
@@ -1033,11 +1054,17 @@ def scrape_parallel(urls: List[str], region: str, jitter_seed: int, relax_level:
                 "score": score
             })
 
-    # Дедуп: по домену строго 1 запись (макс 2 при большом разрыве)
+            # Ранняя остановка: в строгой фазе набрали минимум — выходим
+            if relax_level == 0 and len(results) >= MIN_RESULTS:
+                logger.info("Strict phase reached MIN_RESULTS — early exit")
+                break
+
+    # Дедуп по домену: 1–2 записи
     by_domain: Dict[str, List[Dict[str,Any]]] = {}
     for r in results:
         d = domain_of(r["website"])
         by_domain.setdefault(d, []).append(r)
+
     compact: List[Dict[str,Any]] = []
     for d, items in by_domain.items():
         items.sort(key=lambda x: x["score"], reverse=True)
@@ -1118,11 +1145,11 @@ def search():
 
         # основной скрап
         t0 = time.time()
-        web_results = scrape_parallel(urls[:600], region, jitter_seed, relax_level=0)
+        # основной скрап — строгая фаза
+        web_results = scrape_parallel(urls[:400], region, jitter_seed, relax_level=0)
 
-        # добиваем «минимум 25»
+        # добиваем минимум 25
         web_results = ensure_floor(web_results, urls, region, jitter_seed, user_query)
-
         # аккуратно подмешиваем 2–5 из каталога, если есть место
         mix_slots = max(0, min(5, MAX_RESULTS - len(web_results)))
         if mix_slots > 0:
