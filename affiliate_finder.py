@@ -13,11 +13,6 @@ from typing import List, Tuple, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
-import chardet
-import tldextract
-from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 0
-
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -29,7 +24,6 @@ FRONTEND_DIST = os.path.join(BASE_DIR, "frontend_dist")
 DB_PATH = os.getenv("DB_PATH", "search_results.db")
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_KEY", "").strip() or None
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or None
 
 MIN_RESULTS = int(os.getenv("MIN_RESULTS", "25"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
@@ -38,14 +32,10 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "2"))
 STRONG_BLOCK_ON_BAD = (os.getenv("STRONG_BLOCK_ON_BAD", "true").lower() == "true")
 
-STRICT_GEO = (os.getenv("STRICT_GEO", "true").lower() == "true")         # жёсткий фильтр по региону
-STRICT_TOPIC = (os.getenv("STRICT_TOPIC", "true").lower() == "true")     # строго по тематике (маркетинг/affiliate)
-ALLOW_SOCIAL = (os.getenv("ALLOW_SOCIAL", "false").lower() == "true")    # оставлять соцсети (кроме LinkedIn) или нет
-
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.2"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.5"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.25"))
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.55"))
 
 DEFAULT_UA = os.getenv(
     "SCRAPER_UA",
@@ -60,9 +50,6 @@ logger.setLevel(logging.INFO)
 handler = logging.FileHandler("scraper.log", encoding="utf-8") if LOG_TO_FILE else logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
-
-def log_drop(reason: str, url: str):
-    logger.info(f"[DROP] {reason} :: {url}")
 
 # ======================= Flask =======================
 app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path="/")
@@ -106,46 +93,20 @@ def clean_text(s: str) -> str:
 
 def domain_of(url: str) -> str:
     try:
-        return (urlparse(url).netloc or "").lower()
+        d = (urlparse(url).netloc or "").lower()
+        return d[4:] if d.startswith("www.") else d
     except Exception:
         return ""
-
-def ext_of(url: str):
-    try:
-        return tldextract.extract(url)
-    except Exception:
-        return None
 
 def is_cyrillic(text: str) -> bool:
     return bool(CYRILLIC_RE.search(text or ""))
 
-def detect_language(binary: bytes, fallback_html: str = "") -> Optional[str]:
-    try:
-        enc = chardet.detect(binary or b"").get("encoding") or "utf-8"
-        txt = binary.decode(enc, errors="ignore")
-        if not txt and fallback_html:
-            txt = fallback_html
-        if not txt:
-            return None
-        return detect(txt)
-    except Exception:
-        return None
-
-def soup_text(soup: BeautifulSoup, limit_words: int = 2000) -> str:
-    # убираем скрипты/стили
-    for tag in soup(["script", "style", "noscript"]):
-        tag.extract()
-    text = soup.get_text(" ")
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return ""
-    return " ".join(text.split()[:limit_words])
-
 def clean_description(html_or_text) -> str:
     if not html_or_text: return "N/A"
     soup = BeautifulSoup(str(html_or_text), "html.parser")
+    [s.decompose() for s in soup(["script","style","noscript"])]
     text = soup.get_text(" ").strip()
-    return " ".join(text.split()[:220])
+    return " ".join(text.split())
 
 def short(s: str, n=220) -> str:
     s = s or ""
@@ -203,13 +164,6 @@ def init_db():
                     created_at TEXT
                 )"""
             )
-            c.execute(
-                """CREATE TABLE IF NOT EXISTS gemini_cache (
-                    key TEXT PRIMARY KEY,
-                    data TEXT,
-                    created_at TEXT
-                )"""
-            )
             conn.commit()
         logger.info("Database initialized")
     except Exception as e:
@@ -217,16 +171,113 @@ def init_db():
 
 init_db()
 
+# ======================= Regions =======================
+REGION_MAP = {
+    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com"},
+    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us"},
+    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk"},
+    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de"},
+    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr"},
+    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.ru", "tld": "ru"},
+    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com.ua", "tld": "ua"},
+    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.kz", "tld": "kz"},
+    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.by", "tld": "by"},
+    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr"},
+    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae"},
+    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in"},
+    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg"},
+    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es"},
+    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it"},
+    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl"},
+    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se"},
+    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no"},
+    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi"},
+    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz"},
+    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk"},
+    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro"},
+    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu"},
+    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch"},
+    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br"},
+    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx"},
+    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au"},
+    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
+}
+
+# строгая языковая карта (простая, без внешних lib)
+REGION_LANG_ALLOW = {
+    "ua-ua": ("uk", "ru", "en"),
+    "by-ru": ("ru", "en"),
+    "kz-ru": ("ru", "en"),
+    "ru-ru": ("ru", "en"),
+    "wt-wt": ("en", "ru", "uk"),
+}
+
 # ======================= Intent / Filters =======================
 INTENT_AFFILIATE = {
     "affiliate","аффилиат","аффилиэйт","партнерка","партнёрка","партнерская программа","партнёрская программа",
     "реферальная","referral","cpa","игемблинг","игейминг","igaming","casino affiliate","affiliate network",
-    "партнеры казино","партнёры казино","аффилейт","афилейт","опм","opm","outsourced program management",
+    "партнеры казино","партнёры казино","аффилейт","афилейт","opm","outsourced affiliate program management"
 }
 INTENT_LEARN = {
-    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to"
+    "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to",
+    "що таке","лекция","лекція"
 }
 CASINO_TOKENS = {"казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","sportsbook","bookmaker","ставки"}
+
+BAD_DOMAINS_HARD = {
+    "google.com","maps.google.com","baidu.com","zhihu.com","commentcamarche.net",
+    "xnxx.com","pornhub.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx",
+    "addons.mozilla.org","microsoft.com","support.microsoft.com","edge.microsoft.com",
+    "minecraft.net","curseforge.com","planetminecraft.com","softonic.com","apkpure.com","apkcombo.com","uptodown.com",
+}
+
+SOFT_BAD_DOMAINS = {
+    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org","uk.wikipedia.org",
+    "work.ua","rabota.ua","hh.ru","jobs.ua","djinni.co","indeed.com","glassdoor.com",
+    "tut.by","onliner.by","tumba.kz",
+    "facebook.com","instagram.com","x.com","twitter.com","vk.com","ok.ru",
+}
+
+BLOG_HINTS_URL = ("/blog","/news","/article","/articles","/insights","/guide","/guides","/academy","/press","/glossary")
+JOBS_HINTS_URL = ("/jobs","/job","/careers","/vacancies","/vacancy","/rabota","/vakans")
+EVENT_HINTS = ("conference","expo","summit","event","exhibition","agenda","speakers")
+DIRECTORY_HINTS = ("directory","catalog","list","listing","rank","rating","top-","compare","comparison")
+CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
+
+# ======================= Utility filters =======================
+def looks_like_job(url: str, text: str) -> bool:
+    u = url.lower()
+    if any(tok in u for tok in JOBS_HINTS_URL): return True
+    d = domain_of(u)
+    if d in SOFT_BAD_DOMAINS:  # часть job-доменов здесь
+        if "job" in u or "career" in u or "vacanc" in u or "ваканси" in u or "работа" in u:
+            return True
+    t = text.lower()
+    return any(x in t for x in ("vacanc","ваканси","работа","hiring"))
+
+def looks_like_event(url: str, text: str) -> bool:
+    u = url.lower()
+    if any(e in u for e in EVENT_HINTS): return True
+    t = text.lower()
+    return any(e in t for e in EVENT_HINTS)
+
+def looks_like_directory(url: str, text: str) -> bool:
+    u = url.lower()
+    if any(e in u for e in DIRECTORY_HINTS): return True
+    t = text.lower()
+    return any(e in t for e in DIRECTORY_HINTS)
+
+def looks_like_blog(url: str, text: str) -> bool:
+    u = url.lower()
+    if any(e in u for e in BLOG_HINTS_URL): return True
+    t = text.lower()
+    return any(e in t for e in ("what is","що таке","что такое","guide","обзор","overview","гайд","курс","лекция","лекція"))
+
+def is_hard_bad_domain(dom: str) -> bool:
+    if not dom: return False
+    d = dom.lower().lstrip(".")
+    if d.startswith("www."): d = d[4:]
+    return d in BAD_DOMAINS_HARD
 
 def detect_intent(q: str) -> Dict[str, bool]:
     t = (q or "").lower()
@@ -235,209 +286,7 @@ def detect_intent(q: str) -> Dict[str, bool]:
     casino = any(k in t for k in CASINO_TOKENS)
     return {"affiliate": affiliate, "learn": learn, "casino": casino, "business": not learn}
 
-# ======================= Black/Soft Lists =======================
-BAD_DOMAINS_HARD = {
-    "google.com","maps.google.com","baidu.com","zhihu.com","commentcamarche.net",
-    "xnxx.com","pornhub.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx",
-    "vk.com","m.vk.com","ok.ru","ok.me",
-    "microsoft.com","support.microsoft.com","learn.microsoft.com","edge.microsoft.com","aka.ms",
-    "store.steampowered.com","minecraft.net","mojang.com",
-}
-
-SOFT_BAD_DOMAINS = {
-    "hostadvice.com","support.google.com","youtube.com","m.youtube.com",
-    "coinspaid.com","coinspaid.media","vc.ru","habr.com","marketer.ua",
-    "influencermarketinghub.com","timesofcasino.com","thebetting.net","cashradar.ru",
-    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org",
-    "tumba.kz","tumbaonline.kz",
-}
-
-KNOWLEDGE_DOMAINS = {
-    "hubspot.com","coursera.org","ibm.com","sproutsocial.com","digitalmarketinginstitute.com",
-    "harvard.edu","professional.dce.harvard.edu","medium.com","sendx.io","news.ycombinator.com",
-}
-
-SOCIAL_OK = {"linkedin.com","www.linkedin.com"}  # оставляем только LinkedIn при наличии нужных сигналов
-
-COMPANY_URL_TOKENS = [
-    "agency","network","partners","program","programs","platform","services","solutions",
-    "management","consulting","company","about","contact","affiliates","opm","clients","cases"
-]
-
-CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
-
-BLOG_HINTS_URL = ["/blog","/news","/article","/articles","/insights","/guide","/guides","/academy","/press"]
-JOBS_HINTS_URL = ["/jobs","/job","/careers","/vacancies","/vacancy","/rabota","/vakansii"]
-
-SPORTS_TRASH_TOKENS = {"премьер лига","лига чемпионов","таблица","расписание"}
-def looks_like_sports_trash(text: str) -> bool:
-    t = (text or "").lower()
-    return any(tok in t for tok in SPORTS_TRASH_TOKENS)
-
-# ======================= Region & Language =======================
-REGION_MAP = {
-    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com", "langs": ["en"]},
-    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us", "langs": ["en"]},
-    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk", "langs": ["en"]},
-    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de", "langs": ["de","en"]},
-    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr", "langs": ["fr","en"]},
-    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.ru", "tld": "ru", "langs": ["ru","en"]},
-    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com.ua", "tld": "ua", "langs": ["uk","ru","en"]},
-    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.kz", "tld": "kz", "langs": ["ru","kk","en"]},
-    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.by", "tld": "by", "langs": ["ru","be","en"]},
-    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr", "langs": ["tr","en"]},
-    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae", "langs": ["en","ar"]},
-    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in", "langs": ["en","hi"]},
-    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg", "langs": ["en"]},
-    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es", "langs": ["es","en"]},
-    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it", "langs": ["it","en"]},
-    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl", "langs": ["nl","en"]},
-    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se", "langs": ["sv","en"]},
-    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no", "langs": ["no","en"]},
-    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi", "langs": ["fi","en"]},
-    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz", "langs": ["cs","en"]},
-    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk", "langs": ["sk","en"]},
-    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro", "langs": ["ro","en"]},
-    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu", "langs": ["hu","en"]},
-    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch", "langs": ["de","fr","it","en"]},
-    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br", "langs": ["pt","en"]},
-    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx", "langs": ["es","en"]},
-    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au", "langs": ["en"]},
-    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz", "langs": ["en"]},
-}
-
-# Гео-экстра: токены для текста
-REGION_EXTRAS = {
-    "kz-ru": {"tokens": ["Казахстан","Алматы","Алма-Ата","Astana","Астана","Нур-Султан","KZ","Kazakhstan"], "tld": "kz"},
-    "ru-ru": {"tokens": ["Россия","Москва","Санкт-Петербург","RF"], "tld": "ru"},
-    "ua-ua": {"tokens": ["Україна","Київ","Львів","Одеса","Ukraine","Kyiv"], "tld": "ua"},
-    "by-ru": {"tokens": ["Беларусь","Минск","Belarus"], "tld": "by"},
-    "tr-tr": {"tokens": ["Türkiye","Istanbul","Ankara","Turkiye","Turkey"], "tld": "tr"},
-    "ae-en": {"tokens": ["UAE","Dubai","Abu Dhabi","United Arab Emirates"], "tld": "ae"},
-    "in-en": {"tokens": ["India","Delhi","Bengaluru","Mumbai"], "tld": "in"},
-    "uk-en": {"tokens": ["United Kingdom","London","UK"], "tld": "uk"},
-    "us-en": {"tokens": ["USA","United States","New York","San Francisco"], "tld": "us"},
-}
-
-# ======================= Query building =======================
-def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
-    parts = [q]
-    if intent.get("business"):
-        parts.append("-site:wikipedia.org -news -forum -форум -guide -answers -reddit")
-    if intent.get("affiliate") and intent.get("casino"):
-        parts += [
-            "-site:askgamblers.com", "-site:casino.org", "-site:bonusfinder.com",
-            "-вакансии","-вакансия","-работа","-hh.ru","-job","-jobs","-career",
-            "-\"what is\"", "-\"что такое\"", "-glossary"
-        ]
-    query = " ".join(parts)
-    return query[:600]
-
-def apply_geo_bias(queries: List[str], region: str) -> List[str]:
-    hint = REGION_EXTRAS.get(region)
-    cfg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
-    if not hint:
-        return queries
-    tld = hint.get("tld", cfg.get("tld", "com"))
-    tokens = hint.get("tokens", [])
-    out = []
-    for i, q in enumerate(queries):
-        if i == 0:
-            out.append(f"{q} {' '.join(tokens)}")
-        elif i == 1:
-            out.append(f"{q} site:.{tld}")
-        elif i == 2:
-            out.append(f"{q} site:*.{tld}")
-        else:
-            out.append(q)
-    return out
-
-def fallback_expand_queries(user_prompt: str, intent: Dict[str,bool], region: str = "wt-wt") -> List[str]:
-    base = user_prompt.strip()
-    qs = [base]
-    casino_aff = intent.get("affiliate") and intent.get("casino")
-    if casino_aff:
-        core = [
-            "casino affiliate marketing agency",
-            "igaming affiliate management company",
-            "casino affiliate program management",
-            "igaming affiliate agency services",
-            "outsourced affiliate program management igaming",
-            "casino affiliate network management",
-            "igaming growth agency affiliates",
-            "casino performance marketing agency affiliates",
-            "casino affiliate platform for operators",
-            "partner program setup for casino",
-        ]
-        local = [
-            "агентство по аффилиат маркетингу казино",
-            "управление партнерской программой казино",
-            "игейминг аффилиат агентство",
-        ]
-        # локализация
-        if region in REGION_EXTRAS:
-            loc = REGION_EXTRAS[region]
-            tkns = loc.get("tokens", [])
-            tld = loc.get("tld", "")
-            cities = " ".join(tkns[:2]) if tkns else ""
-            local += [
-                f"casino affiliate agency {cities}".strip(),
-                f"affiliate marketing agency site:.{tld}".strip() if tld else "",
-                f"igaming affiliate agency {cities}".strip(),
-            ]
-        qs += [x for x in core + local if x]
-    else:
-        qs += [
-            f"{base} agency", f"{base} services", f"{base} company", f"{base} companies",
-            f"{base} directory", f"{base} providers",
-        ]
-    return list(dict.fromkeys(qs))
-
-def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
-    if region not in REGION_MAP:
-        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
-        region = "wt-wt"
-    intent = detect_intent(user_prompt)
-    queries: List[str] = []
-    if GEMINI_API_KEY:
-        try:
-            body = {
-                "system_instruction": {"parts": [{"text":
-                    "Ты помощник-поисковик. Верни JSON-массив из 10-14 коротких поисковых фраз по теме. "
-                    "Если тема — аффилиатки/казино — добавляй agency/opm/management. Только массив строк."
-                }]},
-                "contents": [{"parts": [{"text": f"Запрос: {user_prompt}\nРегион: {region}"}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512, "responseMimeType": "application/json"}
-            }
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-            r = requests.post(url, params={"key": GEMINI_API_KEY}, json=body, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
-            text = ""
-            try:
-                cands = data.get("candidates", [])
-                if cands and "content" in cands[0]:
-                    parts = cands[0]["content"].get("parts", [])
-                    text = "".join(p.get("text","") for p in parts if "text" in p)
-            except Exception:
-                pass
-            arr = []
-            try:
-                txt = clean_text(text)
-                arr = json.loads(txt) if txt else []
-            except Exception:
-                arr = []
-            if isinstance(arr, list) and arr:
-                queries = [clean_text(str(x)) for x in arr if isinstance(x,(str,int,float))][:14]
-        except Exception as e:
-            logger.warning(f"Gemini failed: {e}")
-    if not queries:
-        queries = fallback_expand_queries(user_prompt, intent, region)
-    queries = apply_geo_bias(queries, region)
-    logger.info(f"Region={region}; queries={len(queries)}")
-    return queries, queries, region, intent
-
-# ======================= Search engines =======================
+# ======================= Request counter =======================
 def _load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
@@ -458,18 +307,87 @@ def _save_request_count(count):
     except Exception as e:
         logger.error(f"Failed to save request count: {e}")
 
-def duckduckgo_search(query, max_results=15, region="wt-wt", intent=None, force_ru_ddg=False):
+# ======================= Query building =======================
+def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
+    """
+    Никакой «магии» — только минус-слова против информационного мусора и вакансий.
+    """
+    parts = [q]
+    parts += ["-site:wikipedia.org", "-site:facebook.com", "-site:instagram.com", "-site:x.com", "-site:twitter.com", "-site:vk.com"]
+    parts += ["-jobs", "-job", "-vacancy", "-вакансия", "-вакансии", "-rabota", "-careers", "-hh.ru"]
+    parts += ["-blog", "-news", "-guide", "-overview", "-press", "-что", "-що", "-definition"]
+    # режем edge/minecraft итп чтобы не прорывались случайные мусорные хиты
+    parts += ["-download", "-apk", "-edge", "-minecraft", "-browser"]
+    query = " ".join(parts)
+    return query
+
+def build_core_queries(user_prompt: str) -> List[str]:
+    """
+    Фразы стабильные, одинаковые для всех регионов (как просил),
+    меняется только гео-биас дальше.
+    """
+    base = user_prompt.strip()
+    core = [
+        base,
+        "casino affiliate marketing agency",
+        "igaming affiliate agency",
+        "casino affiliate program management",
+        "igaming affiliate management company",
+        "outsourced affiliate program management igaming",
+        "casino affiliate network for operators",
+        "igaming affiliate platform for operators",
+        "casino affiliate services for operators",
+        "игейминг аффилиат агентство",
+        "агентство по аффилиат маркетингу казино",
+        "управление партнерской программой казино",
+    ]
+    # удаляем дубликаты, чистим
+    seen = set(); out = []
+    for q in core:
+        q = clean_text(q)
+        if q and q not in seen:
+            out.append(q); seen.add(q)
+    return out
+
+def apply_geo_bias(queries: List[str], region: str) -> List[str]:
+    """
+    Меняется только регион поиска:
+      1) первый запрос — добавляем название страны (мягко);
+      2) второй — site:.tld
+      3) третий — site:*.tld
+    Всё. Остальные фразы — как есть.
+    """
+    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
+    tld = reg["tld"]
+    country_hint = {
+        "ua-ua": "Україна OR Ukraine",
+        "by-ru": "Беларусь OR Belarus",
+        "kz-ru": "Казахстан OR Kazakhstan",
+        "ru-ru": "Россия OR Russia",
+        "wt-wt": "",
+    }.get(region, "")
+    out = []
+    for i, q in enumerate(queries):
+        if i == 0 and country_hint:
+            out.append(f"{q} ({country_hint})")
+        elif i == 1 and tld:
+            out.append(f"{q} site:.{tld}")
+        elif i == 2 and tld:
+            out.append(f"{q} site:*.{tld}")
+        else:
+            out.append(q)
+    return out
+
+# ======================= Search engines =======================
+def duckduckgo_search(query, max_results=15, region="wt-wt"):
     data = _load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
         return []
-    real_region = "ru-ru" if (force_ru_ddg and region == "wt-wt") else region
-    q = with_intent_filters(query, intent or {"business": True})
-    logger.info(f"DDG search: '{q}' region={real_region}")
     urls = []
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(q, region=real_region, safesearch="moderate", timelimit="y", max_results=max_results)
+            results = ddgs.text(query, region=region, safesearch="moderate", timelimit="y", max_results=max_results)
             for r in results:
                 href = r.get("href")
                 if href: urls.append(href)
@@ -478,28 +396,28 @@ def duckduckgo_search(query, max_results=15, region="wt-wt", intent=None, force_
         urls = [u for u in urls if not is_hard_bad_domain(domain_of(u))]
         return list(dict.fromkeys(urls))[:max_results]
     except Exception as e:
-        logger.error(f"DDG failed for '{q}': {e}")
+        logger.error(f"DDG failed for '{query}': {e}")
         return []
 
-def serpapi_search(query, max_results=15, region="wt-wt", intent=None):
+def serpapi_search(query, max_results=15, region="wt-wt"):
     if not SERPAPI_API_KEY:
         return []
     reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
-    q = with_intent_filters(query, intent or {"business": True})
     params = {
-        "engine": "google", "q": q, "num": max_results, "api_key": SERPAPI_API_KEY,
-        "hl": reg["hl"], "gl": reg["gl"], "google_domain": reg["google_domain"],
+        "engine": "google",
+        "q": query,
+        "num": max_results,
+        "api_key": SERPAPI_API_KEY,
+        "hl": reg["hl"],
+        "gl": reg["gl"],
+        "google_domain": reg["google_domain"],
     }
-    # Лёгкая подсказка локации
-    if region in REGION_EXTRAS:
-        params["location"] = REGION_EXTRAS[region]["tokens"][0]
-    logger.info(f"SerpAPI: '{q}' region={region} domain={reg['google_domain']}")
     try:
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         urls = [it.get("link") for it in data.get("organic_results", []) if it.get("link")]
-        for block in ("inline_results","local_results","shopping_results","top_stories"):
+        for block in ("inline_results","local_results","top_stories"):
             for it in data.get(block, []) or []:
                 link = it.get("link") or it.get("source")
                 if link: urls.append(link)
@@ -510,124 +428,7 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent=None):
         logger.warning(f"SerpAPI error: {e}")
         return []
 
-# ======================= Thematic classifier =======================
-POS_SIGNALS = {
-    # услуги / тип компании
-    "agency","агентство","маркетинг","marketing","performance","growth","digital","media buying","smm","seo","ppc",
-    "affiliate","аффилиат","партнерская программа","опм","opm","affiliate management","partner program",
-    "influencer marketing","b2b marketing","lead generation","traffic","acquisition","retention",
-    "igaming","casino","sportsbook","betting","gambling",
-    "clients","клиенты","cases","кейсы","portfolio","проектов","uslugi","услуги","solutions","services","platform"
-}
-NEG_SIGNALS = {
-    # статьи/словарь/обзорники/форумы/новости
-    "what is","что такое","definition","определение","how to","как работает","guide","гайд","обзор","overview","best ",
-    "forum","форум","news","новости","price list","прайс-лист","вакансии","vacancies","career","careers","job","jobs",
-    # несвязанное
-    "minecraft","edge","microsoft","download","server","torrent","crack","steam","apk","free coins",
-}
-
-def thematic_score(text: str) -> float:
-    t = (text or "").lower()
-    pos = sum(1 for s in POS_SIGNALS if s in t)
-    neg = sum(1 for s in NEG_SIGNALS if s in t)
-    # простая нормировка
-    score = max(0.0, min(1.0, (pos * 0.08) - (neg * 0.10) + (1 if "agency" in t or "агентство" in t else 0) * 0.2))
-    return score
-
-def is_marketing_company(text: str) -> bool:
-    # считаем «компанейские» признаки
-    company_tokens = ["agency","агентство","company","компания","мы работаем","clients","клиенты","cases","кейсы","о нас","about us","услуги","services","solutions"]
-    t = (text or "").lower()
-    has_company = any(tok in t for tok in company_tokens)
-    ts = thematic_score(text)
-    return has_company and ts >= 0.35
-
-# ======================= Region/Language filters =======================
-def is_lang_allowed(lang: Optional[str], region: str) -> bool:
-    if not STRICT_GEO:
-        return True
-    allowed = REGION_MAP.get(region, REGION_MAP["wt-wt"]).get("langs", ["en"])
-    if not lang:
-        return True  # если не смогли определить — не рубим, доверяем далее гео-токенам/TLD
-    # langdetect возвращает 'ru','en','uk','kk','tr','...'
-    return lang.lower() in [l.lower() for l in allowed]
-
-def is_tld_allowed(url: str, region: str) -> bool:
-    if not STRICT_GEO:
-        return True
-    ex = ext_of(url)
-    if not ex:
-        return True
-    host_tld = ex.suffix.split(".")[-1] if ex.suffix else ""
-    region_tld = REGION_MAP.get(region, REGION_MAP["wt-wt"]).get("tld", "com")
-    # допускаем локальный TLD, а также generic: com, io, net, org — но для generic потребуем гео-токены
-    if host_tld == region_tld:
-        return True
-    if host_tld in {"com","io","net","org","co"}:
-        return None  # «условно допустим»: проверим далее гео-токены в тексте
-    return False
-
-def has_geo_tokens(text: str, region: str) -> bool:
-    tokens = REGION_EXTRAS.get(region, {}).get("tokens", [])
-    if not tokens:
-        return True
-    t = (text or "").lower()
-    return any(tok.lower() in t for tok in tokens)
-
-def strict_region_pass(url: str, text: str, lang: Optional[str], region: str) -> bool:
-    """
-    Правило:
-    - если TLD совпадает с регионом — ок;
-    - если TLD generic — требуем geo-токены в тексте (и язык ∈ allowed);
-    - язык страницы должен входить в allow-лист региона (если определился).
-    """
-    if not STRICT_GEO:
-        return True
-    tld_ok = is_tld_allowed(url, region)
-    if tld_ok is False:
-        log_drop("tld_mismatch", url)
-        return False
-    if not is_lang_allowed(lang, region):
-        log_drop(f"lang_not_allowed({lang})", url)
-        return False
-    if tld_ok is None:
-        if not has_geo_tokens(text, region):
-            log_drop("no_geo_tokens_on_generic_tld", url)
-            return False
-    return True
-
-# ======================= URL heuristics =======================
-def looks_like_blog_like(url: str) -> bool:
-    u = (url or "").lower()
-    return any(tok in u for tok in BLOG_HINTS_URL)
-
-def looks_like_job_like(url: str) -> bool:
-    u = (url or "").lower()
-    return any(tok in u for tok in JOBS_HINTS_URL)
-
-def is_company_like(url: str, text: str) -> bool:
-    u = (url or "").lower(); t = (text or "").lower()
-    dom = domain_of(u)
-    # LinkedIn — только company pages с нужными сигналами
-    if dom in SOCIAL_OK:
-        strong = ["affiliate","igaming","casino","agency","partners","network","опм","агентство","аффилиат","партнерская","services"]
-        if any(tok in t for tok in strong) or any(tok in u for tok in strong):
-            return True
-        return False
-    if not ALLOW_SOCIAL:
-        # отсекаем прочие соцсети/мессенджеры
-        bad_social = {"facebook.com","x.com","twitter.com","instagram.com","t.me","telegram.me","vk.com","ok.ru"}
-        if dom in bad_social:
-            return False
-    if any(tok in u for tok in COMPANY_URL_TOKENS): return True
-    if any(tok in u for tok in ["/about","/services","/partners","/program","/contact"]): return True
-    # контентные признаки
-    if is_marketing_company(t):
-        return True
-    return False
-
-# ======================= Extraction & ranking =======================
+# ======================= Scraping & classification =======================
 def extract_basic(soup: BeautifulSoup) -> Dict[str,str]:
     title = (soup.title.string if soup.title and soup.title.string else "").strip()
     name = title
@@ -639,75 +440,79 @@ def extract_basic(soup: BeautifulSoup) -> Dict[str,str]:
     if meta_desc and meta_desc.get("content"):
         description = meta_desc["content"].strip()
     if not description:
+        # небольшой fallback
         p = soup.find("p")
         if p: description = p.get_text(" ").strip()
-    return {"name": short(name, 120) or "N/A", "description": clean_description(description) or "N/A"}
+    text = clean_description(description)
+    return {"name": short(name, 200) or "N/A", "description": text or "N/A"}
 
-def fetch_one(url: str) -> Optional[Dict[str,Any]]:
+def fetch_one(url: str) -> Optional[Dict[str,str]]:
     try:
-        if not url or is_hard_bad_domain(domain_of(url)):
-            log_drop("hard_bad_domain", url)
-            return None
-        headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "en,ru,uk,kk,be,tr,ar;q=0.9"}
+        if not url or is_hard_bad_domain(domain_of(url)): return None
+        headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "en,ru,uk;q=0.9"}
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        if resp.status_code >= 400:
-            log_drop(f"http_{resp.status_code}", url)
-            return None
+        if resp.status_code >= 400: return None
         ct = (resp.headers.get("Content-Type","") or "").lower()
         if "text/html" not in ct and "application/xhtml" not in ct:
-            log_drop("non_html", url)
             return None
-        raw = resp.content or b""
-        soup = BeautifulSoup(raw, "html.parser")
+        soup = BeautifulSoup(resp.content, "html.parser")
         base = extract_basic(soup)
-        page_text = soup_text(soup, limit_words=4000)
-        lang = detect_language(raw, page_text)  # может вернуть None
-        # Отсев мусора из текста
-        if looks_like_sports_trash((base["name"] + " " + base["description"] + " " + page_text)):
-            log_drop("sports_trash", url)
-            return None
-        return {"url": url, "name": base["name"], "description": base["description"], "text": page_text, "lang": lang}
+        text = (base["name"] + " " + base["description"]).lower()
+        return {"url": url, "name": base["name"], "description": text}
     except Exception:
-        log_drop("exception_fetch", url)
         return None
 
-def rank_result(page: Dict[str,Any], phrases: List[str], url: Optional[str], region: str, boosts: Dict[str,float]) -> float:
-    d = ((page.get("name","") + " " + page.get("description","") + " " + page.get("text","")) or "").lower()
-    score = 0.0
-    # тематическая релевантность
-    score += thematic_score(d) * 0.6
-    # совпадение с подзапросами
-    for p in phrases:
-        p = p.lower()
-        if p and p in d: score += 0.20
-        for w in p.split():
-            if len(w) > 3 and w in d: score += 0.08
-    if url:
-        u = url.lower()
-        dom = domain_of(url)
-        # мусор/энциклопедии — мягкий штраф
-        if dom in SOFT_BAD_DOMAINS or dom in KNOWLEDGE_DOMAINS:
-            score -= 0.35
-        # «похоже на компанию»
-        if is_company_like(u, d): score += 0.35
-        # блоги/обзоры — минус
-        if looks_like_blog_like(u): score -= 0.22
-        if looks_like_job_like(u): score -= 0.60
-        # операторы казино — минус (нам нужны агентства/платформы)
-        if any(u.endswith(t) for t in CASINO_TLDS): score -= 0.25
-        # история
-        score += boosts.get(dom, 0.0)
-        score -= domain_penalty(dom)
-        # локальный бонус за TLD/гео-слова
-        reg_extras = REGION_EXTRAS.get(region, {})
-        region_tld = "." + reg_extras.get("tld", REGION_MAP.get(region, REGION_MAP["wt-wt"]).get("tld",""))
-        if region_tld and u.endswith(region_tld): score += 0.25
-        for tok in reg_extras.get("tokens", []):
-            if tok and tok.lower() in d:
-                score += 0.08
-    return max(0.0, min(score, 1.0))
+def is_affiliate_igaming_company(url: str, text: str) -> bool:
+    """
+    Пропускаем только если на странице одновременно:
+      - есть affiliate/партнёрка/программа и
+      - есть casino/igaming/беттинг.
+    И это не блог/новость/вакансия/конфа/каталог.
+    """
+    u = url.lower(); t = text.lower()
 
-# ======================= DB helpers =======================
+    # отсекаем типовой мусор
+    if looks_like_job(u, t): return False
+    if looks_like_event(u, t): return False
+    if looks_like_directory(u, t): return False
+    if looks_like_blog(u, t): return False
+
+    # must-have токены
+    has_aff = any(k in t for k in (
+        "affiliate", "affiliat", "партнерск", "партнёрск", "рефераль", "partner program", "opm", "outsourced"
+    ))
+    has_ig = any(k in t for k in (
+        "igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker"
+    ))
+    if not (has_aff and has_ig):
+        return False
+
+    # немного company-like признаков
+    if any(k in u for k in ("/services","/solutions","/platform","/program","/partners","/about","/contact","/affiliat")):
+        return True
+    if any(k in t for k in ("our services","services","solutions","platform","for operators","для операторов","о нас","контакты","кейсы","clients","features","integrations","pricing","demo")):
+        return True
+
+    # если не нашли company-like, но признаки сильные — всё равно пускаем
+    return True
+
+def region_language_ok(text: str, region: str) -> bool:
+    """
+    Очень простая языковая проверка, без внешних lib.
+    """
+    allowed = REGION_LANG_ALLOW.get(region, REGION_LANG_ALLOW["wt-wt"])
+    t = text.lower()
+    has_cyr = bool(re.search(r"[а-яё]", t))
+    has_ukr = bool(re.search(r"[іїєґ]", t))
+    if has_ukr:
+        lang = "uk"
+    elif has_cyr:
+        lang = "ru"
+    else:
+        lang = "en"
+    return lang in allowed
+
+# ======================= Persistence =======================
 def insert_query_record(text: str, intent: Dict[str,bool], region: str) -> str:
     qid = str(uuid.uuid4())
     try:
@@ -769,22 +574,35 @@ def save_to_csv_txt():
     except Exception as e:
         logger.error(f"Export failed: {e}")
 
-# ======================= History/penalties =======================
-def domain_penalty(domain: str) -> float:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            since = (datetime.utcnow() - timedelta(days=60)).isoformat()
-            c.execute("""SELECT COUNT(*) FROM interactions
-                         WHERE domain=? AND action='bad' AND created_at>=?""", (domain, since))
-            cnt = c.fetchone()[0] or 0
-            if cnt >= 3: return 0.5
-            return min(cnt * (0.5 / 3), 0.5)
-    except Exception:
-        return 0.0
+# ======================= Pipeline =======================
+def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
+    if region not in REGION_MAP:
+        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
+        region = "wt-wt"
+    intent = detect_intent(user_prompt)
+    base_queries = build_core_queries(user_prompt)
+    queries = apply_geo_bias(base_queries, region)
+    # лёгкая анти-мусорная приправка
+    queries = [with_intent_filters(q, intent) for q in queries]
+    return queries, base_queries, region, intent
+
+def collect_urls(web_queries: List[str], region: str, engine: str, per_query_k: int) -> List[str]:
+    all_urls: List[str] = []
+    for q in web_queries:
+        all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region))
+        if engine in ("serpapi","both") and SERPAPI_API_KEY:
+            all_urls.extend(serpapi_search(q, max_results=per_query_k, region=region))
+    deduped = []
+    seen = set()
+    for u in all_urls:
+        if not u or u in seen: continue
+        d = domain_of(u)
+        if is_hard_bad_domain(d): continue
+        if STRONG_BLOCK_ON_BAD and domain_is_blocked(d): continue
+        deduped.append(u); seen.add(u)
+    return deduped
 
 def domain_is_blocked(domain: str) -> bool:
-    if not STRONG_BLOCK_ON_BAD: return False
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -796,66 +614,10 @@ def domain_is_blocked(domain: str) -> bool:
     except Exception:
         return False
 
-def history_boosts(intent: Dict[str,bool], region: str) -> Dict[str, float]:
-    boosts: Dict[str, float] = {}
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT domain, COUNT(*) as cnt
-                FROM results_history
-                WHERE intent_json = ? AND region = ?
-                GROUP BY domain
-                HAVING cnt >= 2
-            """, (json.dumps(intent, ensure_ascii=False), region))
-            for domain, cnt in c.fetchall():
-                boosts[domain] = min(0.2, 0.05 * (1 + (cnt ** 0.5)))
-            c.execute("""
-                SELECT domain,
-                       SUM(CASE WHEN action='good' THEN weight WHEN action='click' THEN weight*0.5 ELSE 0 END) as pos,
-                       SUM(CASE WHEN action='bad' THEN -weight ELSE 0 END) as neg
-                FROM interactions GROUP BY domain
-            """)
-            for domain, pos, neg in c.fetchall():
-                p = pos or 0.0; n = neg or 0.0
-                adj = min(0.15 * (1 + (p ** 0.5)) - 0.1 * (1 + (n ** 0.5)), 0.3)
-                pen = domain_penalty(domain)
-                boosts[domain] = max(min(boosts.get(domain, 0.0) + adj - pen, 0.3), -0.5)
-    except Exception as e:
-        logger.warning(f"history_boosts error: {e}")
-    return boosts
-
-# ======================= Pipeline =======================
-def is_hard_bad_domain(dom: str) -> bool:
-    if not dom: return False
-    d = dom.lower().lstrip(".")
-    if d.startswith("www."): d = d[4:]
-    return d in BAD_DOMAINS_HARD
-
-def collect_urls(web_queries: List[str], region: str, intent: Dict[str,bool], engine: str, force_ru_ddg: bool, per_query_k: int) -> List[str]:
-    all_urls: List[str] = []
-    for q in web_queries:
-        all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region, intent=intent, force_ru_ddg=force_ru_ddg))
-        if engine in ("serpapi","both") and SERPAPI_API_KEY:
-            all_urls.extend(serpapi_search(q, max_results=per_query_k, region=region, intent=intent))
-    deduped = []
-    seen = set()
-    for u in all_urls:
-        if not u or u in seen: continue
-        d = domain_of(u)
-        if is_hard_bad_domain(d):
-            log_drop("hard_bad_domain@collect", u)
-            continue
-        if STRONG_BLOCK_ON_BAD and domain_is_blocked(d):
-            log_drop("domain_blocked_feedback", u)
-            continue
-        deduped.append(u); seen.add(u)
-    return deduped
-
-def scrape_parallel(urls: List[str], phrases: List[str], region: str, boosts: Dict[str,float]) -> List[Dict[str,Any]]:
+def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []
-    maybe_results: List[Tuple[str,float,str,str]] = []
 
+    # per-host limit
     per_host_counter: Dict[str,int] = {}
     filtered_urls = []
     for u in urls:
@@ -865,89 +627,68 @@ def scrape_parallel(urls: List[str], phrases: List[str], region: str, boosts: Di
         per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
         filtered_urls.append(u)
 
+    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
+    tld = "." + reg["tld"] if reg.get("tld") else ""
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fut2url = {ex.submit(fetch_one, u): u for u in filtered_urls}
         for fut in as_completed(fut2url):
             item = fut.result()
-            if not item:
+            if not item: continue
+            url = item["url"]; name = item["name"]; desc = item["description"]
+            d = domain_of(url)
+
+            # жёсткий срез нерелевантных типов
+            if looks_like_job(url, desc):
+                continue
+            if looks_like_event(url, desc):
+                continue
+            if looks_like_directory(url, desc):
+                continue
+            if looks_like_blog(url, desc):
                 continue
 
-            url = item["url"]
-            name = item["name"]
-            desc = item["description"]
-            text = item.get("text","")
-            lang = item.get("lang")
-
-            # Жёсткие фильтры тематики/гео
-            if STRICT_TOPIC and not is_marketing_company(name + " " + desc + " " + text):
-                log_drop("not_marketing_company", url)
-                continue
-            if STRICT_GEO and not strict_region_pass(url, name + " " + desc + " " + text, lang, region):
-                # причина залогирована внутри strict_region_pass
+            # тематическая проверка (affiliate & igaming ОБЯЗАТЕЛЬНО)
+            if not is_affiliate_igaming_company(url, desc):
                 continue
 
-            sc = rank_result(item, phrases, url, region, boosts)
-            u = url.lower()
+            # языковой фильтр
+            if not region_language_ok(desc, region):
+                continue
 
-            is_dir_like = any(tok in u for tok in ["directory","/list","/listing","/rank","/top","/best","/reviews","/review","/rating","/comparison","compare"])
-            is_blog = looks_like_blog_like(u)
-            is_job = looks_like_job_like(u)
+            # бонус локальному TLD: если регион != wt-wt, сначала берём .tld
+            score = 1.0
+            if tld and url.lower().endswith(tld):
+                score += 0.3
+            # штраф за «операторские» TLD (не агентства)
+            if any(url.lower().endswith(ct) for ct in CASINO_TLDS):
+                score -= 0.2
 
-            keep = True
-            tag = "ok"
-            if is_job:
-                keep = False
-                log_drop("jobs_page", url)
-            elif is_dir_like and sc < 0.62:
-                keep = False
-                tag = "maybe"
-                log_drop("directory_low_score", url)
-            elif is_blog and sc < 0.58:
-                keep = False
-                tag = "maybe"
-                log_drop("blog_low_score", url)
-
-            if looks_like_sports_trash(name + " " + desc):
-                keep = False
-                log_drop("sports_trash_meta", url)
-
-            row = {
-                "id": str(uuid.uuid4()),
-                "name": name or "N/A",
-                "website": url,
-                "description": desc or "N/A",
-                "country": "N/A",
-                "source": "Web",
-                "score": sc
-            }
-
-            if keep:
-                results.append(row)
-            else:
-                if tag == "maybe":
-                    maybe_results.append(("maybe", sc, name, url, desc))
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-
-    if len(results) < MIN_RESULTS and maybe_results:
-        maybe_results.sort(key=lambda t: t[1], reverse=True)
-        for _, sc, name, url, desc in maybe_results:
             results.append({
                 "id": str(uuid.uuid4()),
                 "name": name or "N/A",
                 "website": url,
-                "description": desc or "N/A",
+                "description": short(desc, 400),
                 "country": "N/A",
                 "source": "Web",
-                "score": sc
+                "score": max(0.0, min(score, 1.5))
             })
-            if len(results) >= MIN_RESULTS:
-                break
 
+    # 1) приоритет локальных доменов, затем остальные
+    if tld:
+        local = [r for r in results if r["website"].lower().endswith(tld)]
+        global_ = [r for r in results if not r["website"].lower().endswith(tld)]
+        results = local + global_
+
+    # обрезаем до MAX_RESULTS
+    results = results[:MAX_RESULTS]
     return results
 
-def ensure_minimum(results: List[Dict[str,Any]], target_min: int) -> List[Dict[str,Any]]:
-    return results
+def save_to_db_and_files(web_results: List[Dict[str,Any]], intent: Dict[str,bool], region: str, query_id: str):
+    for r in web_results:
+        save_result_records(r, intent, region, query_id)
+    if web_results:
+        save_to_csv_txt()
 
 # ======================= API =======================
 @app.route("/search", methods=["POST", "OPTIONS"])
@@ -972,38 +713,37 @@ def search():
             c.execute("DELETE FROM results")
             conn.commit()
 
-        # генерим подзапросы
+        # генерим подзапросы (одинаково для всех регионов; меняется только гео-биас)
         web_queries, phrases, region, intent = generate_search_queries(user_query, region)
 
         # пишем запрос
         query_id = insert_query_record(user_query, intent, region)
 
-        # история бустов/штрафов
-        boosts = history_boosts(intent, region)
-
-        # если кириллица и регион дефолтный — ddg в ru-ru; иначе — не трогаем выбранный регион
-        force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
-        logger.info(f"force_ru_ddg={force_ru_ddg} (query_has_cyrillic={is_cyrillic(user_query)})")
-
         # собираем URL’ы
-        urls = collect_urls(web_queries, region, intent, engine, force_ru_ddg, per_query_k=10)
+        urls = collect_urls(web_queries, region, engine, per_query_k=10)
         logger.info(f"Pre-filtered URLs (unique & not blocked): {len(urls)}")
 
-        # параллельный скрейп
+        # параллельный скрейп + строгая тематичность + локальный приоритет
         t0 = time.time()
-        web_results = scrape_parallel(urls[:300], phrases, region, boosts)
+        web_results = scrape_parallel(urls[:300], region)
         dt = time.time() - t0
         logger.info(f"Scraped {len(web_results)} results in {dt:.2f}s")
 
-        # минимум/максимум
-        web_results = web_results[:MAX_RESULTS]
-        web_results = ensure_minimum(web_results, MIN_RESULTS)
+        # добор до минимума: если не хватает, ослабим только локальный приоритет (но НЕ тематику)
+        if len(web_results) < MIN_RESULTS:
+            # просто возьмём ещё хвост урлов
+            extra_urls = urls[300:600]
+            if extra_urls:
+                more = scrape_parallel(extra_urls, region)
+                # склеиваем с уникализацией
+                known = set(r["website"] for r in web_results)
+                for r in more:
+                    if r["website"] not in known:
+                        web_results.append(r); known.add(r["website"])
+                web_results = web_results[:MAX_RESULTS]
 
         # запись в БД + экспорт
-        for r in web_results:
-            save_result_records(r, intent, region, query_id)
-        if web_results:
-            save_to_csv_txt()
+        save_to_db_and_files(web_results, intent, region, query_id)
 
         return jsonify({
             "results": web_results,
