@@ -768,6 +768,48 @@ def fallback_expand_queries(user_prompt: str, region: str, intent: Dict[str, boo
     logger.info(f"Using fallback for query expansion (affiliate={intent.get('affiliate')}, casino={intent.get('casino')}), produced {len(queries)} queries")
     return queries, queries
 
+# ========= Generate queries (wrapper) =========
+def generate_search_queries(user_prompt: str, region: str = "wt-wt") -> Tuple[List[str], List[str], str, Dict[str, bool]]:
+    """
+    Возвращает:
+      - web_queries: список строк для поисковиков
+      - prompt_phrases: те же фразы (или их часть) для ранжирования/скрейпа
+      - region: нормализованный регион
+      - intent: словарь намерений (affiliate/learn/casino/business)
+    """
+    # нормализуем регион
+    if region not in REGION_MAP:
+        logger.warning(f"Invalid region {region}, defaulting to wt-wt")
+        region = "wt-wt"
+
+    # пустой запрос — безопасные дефолты
+    user_prompt = (user_prompt or "").strip()
+    if not user_prompt:
+        return [user_prompt], [], region, {
+            "affiliate": False, "learn": False, "casino": False, "business": True
+        }
+
+    # определяем интент
+    intent = detect_intent(user_prompt)
+
+    # пробуем Gemini -> fallback
+    try:
+        web_queries, phrases = gemini_expand_queries(user_prompt, region, intent)
+    except Exception as e:
+        logger.warning(f"Gemini failed or invalid output: {e}. Falling back.")
+        web_queries, phrases = fallback_expand_queries(user_prompt, region, intent)
+
+    # лёгкий гео-байас и очистка
+    web_queries = apply_geo_bias(web_queries, region)
+    web_queries = [q.strip() for q in web_queries if q and isinstance(q, str)]
+    # защита от слишком длинных и дублей
+    web_queries = list(dict.fromkeys([q for q in web_queries if len(q) <= 200]))[:20]
+
+    # если Gemini вернул пусто, используем fallback как фразы
+    if not phrases:
+        phrases = web_queries[:12]
+
+    return web_queries, phrases, region, intent
 # ========= Build query with negative filters =========
 NEGATIVE_SITES_FOR_BUSINESS = [
     "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
@@ -812,12 +854,16 @@ BLOG_TEXT_TOKENS_EN = [
     "case study", "case studies", "research", "whitepaper", "press release", "academy", "resource", "library"
 ]
 
+ALWAYS_BLOG_DOMAINS = {
+    "vc.ru","dtf.ru","habr.com","habr.ru","medium.com","substack.com","teletype.in","spark.ru","dzen.ru","zen.yandex.ru"
+}
+
 def looks_like_blog(url: str, text: str) -> bool:
     u = (url or "").lower()
     if any(tok in u for tok in BLOG_URL_TOKENS):
         return True
     d = domain_of(u)
-    if d in BAD_DOMAINS:
+    if d in ALWAYS_BLOG_DOMAINS:
         return True
     t = (text or "").lower()
     return any(tok in t for tok in BLOG_TEXT_TOKENS_RU) or any(tok in t for tok in BLOG_TEXT_TOKENS_EN)
