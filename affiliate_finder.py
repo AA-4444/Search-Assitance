@@ -1429,25 +1429,36 @@ def search():
         logger.error(f"API error: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 # ========= Feedback API =========
-@app.route("/feedback", methods=["POST"])
+@app.route("/feedback", methods=["POST", "OPTIONS"])
 def feedback():
-    """
-    body: { "query_id": "...", "url": "...", "action": "click|good|bad|flag" }
-    """
+    """body: { "query_id": "...", "url": "...", "action": "click|good|bad|flag" }"""
+    if request.method == "OPTIONS":
+        # дать браузеру CORS preflight
+        resp = app.make_default_options_response()
+        origin = request.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
+
     try:
         data = request.json or {}
         query_id = (data.get("query_id") or "").strip()
         url = (data.get("url") or "").strip()
         action = (data.get("action") or "").strip().lower()
 
-        if action == "flag":  # маппим фронтовый флажок на 'bad'
+        if action == "flag":
             action = "bad"
 
         if not (query_id and url and action in {"click","good","bad"}):
             return jsonify({"error": "query_id, url, action(click|good|bad|flag) required"}), 400
 
-        # веса: click = +1.0 (слегка положительный), good = +2.0 (явно положительный), bad = +2.0 (явно отрицательный)
         weight = 1.0 if action == "click" else 2.0
 
         with sqlite3.connect(DB_PATH) as conn:
@@ -1463,6 +1474,11 @@ def feedback():
     except Exception as e:
         logger.error(f"/feedback error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# алиас под /api/*
+@app.route("/api/feedback", methods=["POST", "OPTIONS"])
+def api_feedback():
+    return feedback()
 
 # ========= API aliases /api/* =========
 @app.route("/api/search", methods=["POST", "OPTIONS"])
