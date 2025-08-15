@@ -381,7 +381,7 @@ INTENT_LEARN = {
     "что такое","what is","определение","definition","гайд","guide","обзор","overview","курс","course","как работает","how to"
 }
 CASINO_TOKENS = {
-    "казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","ставки","bookmaker","sportsbook"
+    "казино","casino","igaming","гемблинг","игемблинг","игейминг","беттинг","ставки","bookmaker","sportsbook","slots"
 }
 
 def detect_intent(q: str) -> Dict[str, bool]:
