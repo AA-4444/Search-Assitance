@@ -99,13 +99,13 @@ logger.addHandler(handler)
 # ========= Limits / pauses =========
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.4"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.8"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.2"))
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.4"))
 
 # ========= affcatalog config =========
 AFFCATALOG_BASE = os.getenv("AFFCATALOG_BASE", "https://affcatalog.com/ru/")
-AFFCATALOG_MIN = int(os.getenv("AFFCATALOG_MIN", "4"))
-AFFCATALOG_MAX = int(os.getenv("AFFCATALOG_MAX", "6"))
+AFFCATALOG_MIN = int(os.getenv("AFFCATALOG_MIN", "8"))
+AFFCATALOG_MAX = int(os.getenv("AFFCATALOG_MAX", "12"))
 
 # ========= Search engines & helpers =========
 from ddgs import DDGS
@@ -324,18 +324,21 @@ BAD_DOMAINS = {
     "romeo.com","xnxx.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx","sport.ua",
     "openai.com","community.openai.com","discourse-cdn.com","stackoverflow.com",
     "maps.google.com", "google.com/maps", "yelp.com", "tripadvisor.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
-    "linkedin.com", "pinterest.com", "tiktok.com"
+    "linkedin.com", "pinterest.com", "tiktok.com", "gorodrabot.ru", "payment-provider.com"
 }
 def is_bad_domain(dom: str) -> bool:
     if not dom:
         return False
     d = dom.lower().lstrip(".")
+    # общие паттерны
     if d.endswith("wikipedia.org"):
         return True
     if d.startswith("google.") or d.endswith(".google.com") or d == "google.com":
         return True
+    # отрезаем www.
     if d.startswith("www."):
         d = d[4:]
+    # точное совпадение с «плохими»
     if d in BAD_DOMAINS:
         return True
     return False
@@ -350,6 +353,17 @@ SPORTS_TRASH_TOKENS = {
     "футбол","теннис","биатлон","хокей","баскетбол","волейбол","снукер",
     "премьер лига","лига чемпионов","таблица","расписание","тв-программа"
 }
+
+NON_AFFILIATE_TOKENS = {
+    "вакансии", "работа", "job", "vacancy", "employment", "платежные", "payment provider",
+    "recruitment", "career", "hiring"
+}
+
+def looks_like_non_affiliate(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(tok in t for tok in NON_AFFILIATE_TOKENS)
 
 def looks_like_sports_garbage(text: str) -> bool:
     if not text:
@@ -482,21 +496,68 @@ def is_relevant_url(url, prompt_phrases):
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     return any(w in u for w in words) or any(p.lower() in u for p in prompt_phrases)
 
-GEO_HINTS = {
-    # как в исходном
+GEO_HINTS: Dict[str, Dict[str, Any]] = {
+    "kz-ru": {"tld": "kz", "tokens": ["Казахстан", "KZ", "Алматы", "Астана", "Astana", "Almaty"]},
+    "kz-kk": {"tld": "kz", "tokens": ["Қазақстан", "KZ", "Алматы", "Астана"]},
+    "by-ru": {"tld": "by", "tokens": ["Беларусь", "BY", "Минск"]},
+    "ua-ua": {"tld": "ua", "tokens": ["Україна", "Украина", "UA", "Київ", "Киев", "Львів", "Одеса"]},
+    "ru-ru": {"tld": "ru", "tokens": ["Россия", "RF", "Москва", "Санкт-Петербург"]},
+    "pl-pl": {"tld": "pl", "tokens": ["Polska", "Poland", "Warszawa"]},
+    "de-de": {"tld": "de", "tokens": ["Deutschland", "Berlin", "München"]},
+    "fr-fr": {"tld": "fr", "tokens": ["France", "Paris"]},
+    "tr-tr": {"tld": "tr", "tokens": ["Türkiye", "Istanbul", "Ankara"]},
+    "ae-en": {"tld": "ae", "tokens": ["UAE", "Dubai", "Abu Dhabi"]},
+    "in-en": {"tld": "in", "tokens": ["India", "Delhi", "Mumbai"]},
+    "sg-en": {"tld": "sg", "tokens": ["Singapore", "SG"]},
+    "jp-ja": {"tld": "jp", "tokens": ["日本", "東京", "Tokyo"]},
+    "kr-ko": {"tld": "kr", "tokens": ["대한민국", "서울", "Seoul"]},
+    "es-es": {"tld": "es", "tokens": ["España", "Madrid", "Barcelona"]},
+    "it-it": {"tld": "it", "tokens": ["Italia", "Roma", "Milano"]},
+    "nl-nl": {"tld": "nl", "tokens": ["Nederland", "Amsterdam"]},
+    "se-sv": {"tld": "se", "tokens": ["Sverige", "Stockholm"]},
+    "no-no": {"tld": "no", "tokens": ["Norge", "Oslo"]},
+    "fi-fi": {"tld": "fi", "tokens": ["Suomi", "Helsinki"]},
+    "cz-cs": {"tld": "cz", "tokens": ["Česko", "Praha"]},
+    "sk-sk": {"tld": "sk", "tokens": ["Slovensko", "Bratislava"]},
+    "ro-ro": {"tld": "ro", "tokens": ["România", "București"]},
+    "hu-hu": {"tld": "hu", "tokens": ["Magyarország", "Budapest"]},
+    "ch-de": {"tld": "ch", "tokens": ["Schweiz", "Zürich"]},
+    "us-en": {"tld": "us", "tokens": ["USA", "United States"]},
+    "uk-en": {"tld": "uk", "tokens": ["United Kingdom", "London"]},
+    "br-pt": {"tld": "br", "tokens": ["Brasil", "São Paulo"]},
+    "mx-es": {"tld": "mx", "tokens": ["México", "CDMX"]},
+    "au-en": {"tld": "au", "tokens": ["Australia", "Sydney", "Melbourne"]},
+    "nz-en": {"tld": "nz", "tokens": ["New Zealand", "Auckland"]},
 }
 
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
     hint = GEO_HINTS.get(region)
-    if not hint or region == "wt-wt":
-        return queries  # нет bias для глобального
-    # остальное как в исходном
+    if not hint:
+        return queries
+    tld = hint["tld"]
+    tokens = hint["tokens"]
+    biased = []
+    for i, q in enumerate(queries):
+        if i == 0:
+            biased.append(f"{q} {' '.join(tokens[:2])}".strip())
+        elif i == 1:
+            biased.append(f"{q} site:.{tld}")
+        else:
+            biased.append(q)
+    return biased
 
 def geo_score_boost(url: str, text: str, region: str) -> float:
     hint = GEO_HINTS.get(region)
-    if not hint or region == "wt-wt":
+    if not hint:
         return 0.0
-    # остальное как в исходном
+    boost = 0.0
+    dom = domain_of(url)
+    if dom.endswith(f".{hint['tld']}"):
+        boost += 0.35
+    t = (text or "").lower()
+    if any(tok.lower() in t for tok in hint["tokens"]):
+        boost += 0.15
+    return min(boost, 0.5)
 
 COMPANY_URL_TOKENS = [
     "agency","network","partners","program","programs","platform","services","solutions",
@@ -509,23 +570,23 @@ def rank_result(description: str, full_text: str, prompt_phrases: List[str], url
     words = [w.lower() for p in prompt_phrases for w in p.split() if len(w) > 3]
     for w in words:
         if w in d:
-            score += 0.3 if len(w) > 6 else 0.2
+            score += 0.2 if len(w) > 6 else 0.1
     for p in prompt_phrases:
         if p.lower() in d:
-            score += 0.4
+            score += 0.3
 
     if url:
         uu = url.lower()
         if any(tok in uu for tok in COMPANY_URL_TOKENS):
-            score += 0.3
+            score += 0.2
         if boosts:
             score += boosts.get(domain_of(url), 0.0)
 
     if url and looks_like_blog(url, d):
-        score = max(score - 0.4, 0.0)
+        score = max(score - 0.3, 0.0)
 
     if looks_like_sports_garbage(d):
-        score = min(score, 0.2)
+        score = min(score, 0.1)
     if url and region:
         score += geo_score_boost(url, d, region)
     return min(max(score, 0.0), 1.0)
@@ -736,7 +797,7 @@ def looks_like_blog(url: str, text: str) -> bool:
     return any(tok in t for tok in BLOG_TEXT_TOKENS_RU) or any(tok in t for tok in BLOG_TEXT_TOKENS_EN)
 
 # ========= Search engines (DDG / SerpAPI) =========
-def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):
+def duckduckgo_search(query, max_results=25, region="wt-wt", intent: Dict[str,bool]=None, force_ru_ddg=False):
     data = load_request_count()
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
@@ -760,7 +821,7 @@ def duckduckgo_search(query, max_results=15, region="wt-wt", intent: Dict[str,bo
         logger.error(f"DDG failed for '{q}': {e}")
         return []
 
-def serpapi_search(query, max_results=15, region="wt-wt", intent: Dict[str,bool]=None):
+def serpapi_search(query, max_results=25, region="wt-wt", intent: Dict[str,bool]=None):
     if not SERPAPI_API_KEY:
         logger.info("SERPAPI_API_KEY is not set; skipping SerpAPI")
         return []
@@ -801,9 +862,10 @@ def should_cut_blog(url: str, text: str, intent: Dict[str,bool]) -> bool:
         return looks_like_blog(url, text)
     return False
 
-def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str):
+def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], region: str, intent: Dict[str,bool], boosts: Dict[str,float], query_id: str, user_urls: List[str]=None):
     logger.info(f"Starting scrape of {len(urls)} URLs")
     results = []
+    urls = (user_urls or []) + urls
     urls = list(dict.fromkeys(urls))[:60]
     for i, url in enumerate(urls, 1):
         logger.info(f"[{i}/{len(urls)}] Scraping: {url}")
@@ -847,13 +909,22 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
 
                 full_text = " ".join([p.get_text(strip=True) for p in soup.find_all('p')])[:3000]
 
-                country = "N/A"
+                country = "Global"
                 el = soup.select_one(".location, .country, .address, .footer-address, div[class*='location'], div[class*='address'], footer, .contact-info")
                 if el:
-                    country = clean_description(el.text)
+                    country_text = clean_description(el.text).lower()
+                    known_countries = ["usa", "russia", "uk", "germany", "france", "ukraine", "canada", "malta", "cyprus", "sweden", "japan"]
+                    for kc in known_countries:
+                        if kc in country_text:
+                            country = kc.title()
+                            break
 
                 if looks_like_sports_garbage(description + full_text):
                     logger.info(f"Skip sports-like garbage: {url}")
+                    success = True
+                    break
+                if looks_like_non_affiliate(description + full_text):
+                    logger.info(f"Skip non-affiliate content: {url}")
                     success = True
                     break
                 if looks_like_definition_page(description + full_text, url, intent):
@@ -871,7 +942,9 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
                     continue
 
                 score = rank_result(description, full_text, prompt_phrases, url=url, region=region, boosts=boosts)
-                if is_relevant_url(url, prompt_phrases) or score > 0.1:
+                if url in (user_urls or []):
+                    score = min(score + 0.2, 1.0)
+                if is_relevant_url(url, prompt_phrases) or score > 0.05:
                     row = {
                         "id": str(uuid.uuid4()),
                         "name": name,
@@ -921,13 +994,13 @@ def _aff_is_relevant_text(t: str) -> bool:
     if not t:
         return False
     tl = t.lower()
-    return any(tok in tl for tok in AFF_RELEVANT_TOKENS_RU) or any(tok in tl for tok in AFF_RELEVANT_TOKENS_EN)
+    return any(tok in tl for tok in AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN + ["affiliate", "partner", "program"])
 
 def _aff_is_relevant_href(href: str) -> bool:
     if not href:
         return False
     h = href.lower()
-    return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS + AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN)
+    return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS)
 
 def _safe_get(url: str, timeout: float = 10.0, allow_proxy_retry: bool = True):
     attempts = 0
@@ -988,10 +1061,20 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
             href = base_url.rstrip("/") + href
         if "affcatalog.com" not in href:
             continue
-        if _aff_is_relevant_href(href) or _aff_is_relevant_text(text):
-            candidates.append(href)
+        candidates.append(href)
+    
+    for href in candidates[:50]:
+        sub_resp = _safe_get(href)
+        if sub_resp:
+            sub_soup = BeautifulSoup(sub_resp.content, "html.parser")
+            for sub_a in sub_soup.find_all("a", href=True):
+                sub_href = sub_a["href"]
+                if sub_href.startswith("/"):
+                    sub_href = base_url.rstrip("/") + sub_href
+                if "affcatalog.com" in sub_href and sub_href not in candidates:
+                    candidates.append(sub_href)
 
-    candidates = list(dict.fromkeys(candidates))
+    candidates = list(dict.fromkeys(candidates))[:100]
     random.shuffle(candidates)
 
     rows: List[dict] = []
@@ -1030,13 +1113,14 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
         if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description + full_text) or _aff_is_relevant_href(href)):
             continue
 
-        country = "N/A"
+        country = "Global"
 
         is_rel, specialization, status, suitability = analyze_result(description, full_text, prompt_phrases)
         if not is_rel:
             continue
 
         score = rank_result(description, full_text, prompt_phrases, url=href, region=region)
+
         row = {
             "id": str(uuid.uuid4()),
             "name": name if name and name != "N/A" else "Affcatalog — партнёрская программа",
@@ -1157,9 +1241,9 @@ def search():
         data = request.json or {}
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
-        max_results = int(data.get("max_results", 15))
-        user_urls = data.get("user_urls", [])  # for mixing in links
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
+        max_results = int(data.get("max_results", 25))
+        user_urls = data.get("user_urls", [])
 
         if not user_query:
             return jsonify({"error": "Query is required"}), 400
@@ -1168,6 +1252,20 @@ def search():
 
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS results (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    website TEXT,
+                    description TEXT,
+                    specialization TEXT,
+                    country TEXT,
+                    source TEXT,
+                    status TEXT,
+                    suitability TEXT,
+                    score REAL
+                )"""
+            )
             cursor.execute("DELETE FROM results")
             conn.commit()
 
@@ -1193,7 +1291,7 @@ def search():
         all_urls = [u for u in list(dict.fromkeys(all_urls)) if not is_bad_domain(domain_of(u))]
         logger.info(f"Collected {len(all_urls)} unique URLs")
 
-        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
+        web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id, user_urls=user_urls)
 
         filtered = []
         for r in web_results:
@@ -1242,6 +1340,7 @@ def search():
         logger.error(f"API error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# ========= Feedback API =========
 @app.route("/feedback", methods=["POST"])
 def feedback():
     try:
@@ -1263,6 +1362,7 @@ def feedback():
         logger.error(f"/feedback error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# ========= API aliases /api/* =========
 @app.route("/api/search", methods=["POST", "OPTIONS"])
 def api_search():
     return search()
@@ -1284,6 +1384,7 @@ def download_file(filetype):
 def api_download(filetype):
     return download_file(filetype)
 
+# ========= Serve SPA (frontend_dist) =========
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
@@ -1295,6 +1396,7 @@ def serve_frontend(path):
         return send_from_directory(FRONTEND_DIST, "index.html")
     return "frontend_dist is missing. Please upload your built frontend.", 404
 
+# ========= Entry =========
 if __name__ == "__main__":
     init_db()
     host = os.getenv("HOST", "0.0.0.0")
