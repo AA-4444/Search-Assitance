@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -19,7 +18,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from ddgs import DDGS
 
-# ========= Optional libs already present in your env
+# ========= Optional libs (present in env)
 try:
     from langdetect import detect as langdetect_detect
 except Exception:
@@ -38,21 +37,32 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY", "").strip() or None
 
 MIN_RESULTS = int(os.getenv("MIN_RESULTS", "25"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
-PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "2"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
+PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "3"))
 STRONG_BLOCK_ON_BAD = (os.getenv("STRONG_BLOCK_ON_BAD", "true").lower() == "true")
 
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1200"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.2"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.5"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.15"))
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.35"))
 
 DEFAULT_UA = os.getenv(
     "SCRAPER_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
+
+# SerpAPI только резерв + cooldown при 429
+SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 минут
+_last_serpapi_429_at = 0.0
+
+# Жёсткий дедлайн на скрапинг (ускоряет ответ)
+SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "120"))  # 2 минуты
+
+# Микрокраул — максимально бережный
+MAX_MICROCRAWL_PAGES = int(os.getenv("MAX_MICROCRAWL_PAGES", "1"))
+ENABLE_MICROCRAWL = (os.getenv("ENABLE_MICROCRAWL", "true").lower() == "true")
 
 # ======================= Logging =======================
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
@@ -94,19 +104,17 @@ CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNOREC
 CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
 
 PHONE_CODE_RE = {
-    "kz-ru": re.compile(r"(\+?7[\s\-]?\(?7\d\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),   # +7 7xx ...
+    "kz-ru": re.compile(r"(\+?7[\s\-]?\(?7\d\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
     "ua-ua": re.compile(r"(\+?380[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
     "ru-ru": re.compile(r"(\+?7[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
     "by-ru": re.compile(r"(\+?375[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
 }
-
 CURRENCY_HINTS = {
     "kz-ru": (("₸","KZT"), 0.25),
     "ua-ua": (("₴","UAH","грн"), 0.25),
     "ru-ru": (("₽","RUB","руб"), 0.2),
     "by-ru": (("Br","BYN","руб"), 0.2),
 }
-
 ACCEPT_LANG_POOL = ["en,ru,uk;q=0.9", "ru,en;q=0.9", "en;q=0.8"]
 
 def clean_text(s: str) -> str:
@@ -128,15 +136,11 @@ def domain_of(url: str) -> str:
 def normalize_url(url: str) -> str:
     try:
         u = urlparse(url)
-        # drop fragments and most tracking params
         query = [(k,v) for k,v in parse_qsl(u.query, keep_blank_values=False) if not k.lower().startswith("utm_")]
         u2 = u._replace(query=urlencode(query, doseq=True), fragment="")
         return urlunparse(u2)
     except Exception:
         return url
-
-def is_cyrillic(text: str) -> bool:
-    return bool(CYRILLIC_RE.search(text or ""))
 
 def short(s: str, n=220) -> str:
     s = s or ""
@@ -144,12 +148,9 @@ def short(s: str, n=220) -> str:
 
 def guess_lang(text: str) -> str:
     t = (text or "").strip()
-    if not t:
-        return "en"
-    if re.search(r"[іїєґ]", t.lower()):  # UA
-        return "uk"
-    if re.search(r"[а-яё]", t.lower()):
-        return "ru"
+    if not t: return "en"
+    if re.search(r"[іїєґ]", t.lower()): return "uk"
+    if re.search(r"[а-яё]", t.lower()): return "ru"
     if langdetect_detect:
         try:
             return langdetect_detect(t)
@@ -158,13 +159,11 @@ def guess_lang(text: str) -> str:
     return "en"
 
 def detect_encoding(content: bytes) -> str:
-    if not content:
-        return "utf-8"
+    if not content: return "utf-8"
     if chardet:
         try:
             enc = chardet.detect(content).get("encoding")
-            if enc:
-                return enc
+            if enc: return enc
         except Exception:
             pass
     return "utf-8"
@@ -221,7 +220,6 @@ def init_db():
                     created_at TEXT
                 )"""
             )
-            # optional helper table for explicit blocks; not required
             c.execute(
                 """CREATE TABLE IF NOT EXISTS domain_blocks (
                     domain TEXT PRIMARY KEY,
@@ -268,7 +266,6 @@ REGION_MAP = {
     "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
 }
 
-# Языковые ограничения по региону
 REGION_LANG_ALLOW = {
     "ua-ua": ("uk", "ru", "en"),
     "by-ru": ("ru", "en"),
@@ -277,10 +274,9 @@ REGION_LANG_ALLOW = {
     "wt-wt": ("en", "ru", "uk"),
 }
 
-# Токены региона для матчей внутри текста (укрепляют региональную привязку)
 REGION_HINTS = {
     "ua-ua": {
-        "tokens": ["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA","Чернівці","Чернігів","Запоріжжя","Миколаїв","Полтава","Вінниця","Суми","Рівне","Івано-Франківськ"],
+        "tokens": ["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA"],
         "org": ["ТОВ","ФОП","LLC","ПП","ПрАТ","АТ"],
         "cities": ["Kyiv","Київ","Lviv","Львів","Odesa","Одеса","Kharkiv","Харків","Dnipro","Дніпро"]
     },
@@ -333,16 +329,23 @@ EVENT_HINTS = ("conference","expo","summit","event","exhibition","agenda","speak
 DIRECTORY_HINTS = ("directory","catalog","list","listing","rank","rating","top-","compare","comparison")
 CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
 
+# Анти-сигналы: операторские и сети для вебмастеров
 OPERATOR_PROGRAM_HINTS = (
     "join our affiliate program","affiliates program","affiliate portal","commission",
     "revshare","cpa","commission tiers","promotional materials","tracking platform",
-    "program terms","payouts","banners","affiliates terms"
+    "program terms","payouts","banners","affiliates terms","sign up and start promoting"
+)
+NETWORK_FOR_PUBLISHERS_HINTS = (
+    "for affiliates","for publishers","become an affiliate","sign up as an affiliate",
+    "traffic sources","webmasters","start promoting","affiliate network"
 )
 
+# Сигналы услуг/управления для операторов (агентства/OPM/платформы)
 COMPANY_SERVICE_HINTS = (
     "our services","services","solutions","platform","for operators","for brands","for advertisers",
     "clients","case study","case studies","features","integrations","pricing",
-    "request a demo","get a demo","contact sales","schedule a call","request proposal"
+    "request a demo","get a demo","contact sales","schedule a call","request proposal",
+    "program management","affiliate management","opm","outsourced program management"
 )
 
 # ======================= Utility filters =======================
@@ -385,25 +388,19 @@ def detect_intent(q: str) -> Dict[str, bool]:
     affiliate = any(k in t for k in INTENT_AFFILIATE)
     learn = any(k in t for k in INTENT_LEARN)
     casino = any(k in t for k in CASINO_TOKENS)
-    # бизнесовый запрос по умолчанию
     return {"affiliate": affiliate or casino, "learn": learn, "casino": casino, "business": not learn}
 
-# ======================= Request counter (пер-движок, back-compatible) =======================
+# ======================= Request counter (по движкам) =======================
 def _load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # back-compat: если старая форма, оборачиваем
             if "engines" not in data:
-                data = {
-                    "engines": {"ddg": {"count": data.get("count", 0)}, "serpapi": {"count": 0}},
-                    "last_reset": data.get("last_reset", datetime.now().strftime("%Y-%m-%d"))
-                }
-            last_reset = data.get("last_reset", "")
-            if last_reset:
-                last_reset_date = datetime.strptime(last_reset, "%Y-%m-%d")
-                if last_reset_date.date() < datetime.now().date():
-                    return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+                data = {"engines": {"ddg": {"count": data.get("count", 0)}, "serpapi": {"count": 0}},
+                        "last_reset": data.get("last_reset", datetime.now().strftime("%Y-%m-%d"))}
+            last_reset_date = datetime.strptime(data["last_reset"], "%Y-%m-%d")
+            if last_reset_date.date() < datetime.now().date():
+                return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
             return data
     except Exception:
         return {"engines": {"ddg":{"count":0},"serpapi":{"count":0}}, "last_reset": datetime.now().strftime("%Y-%m-%d")}
@@ -465,7 +462,6 @@ def build_core_queries(user_prompt: str) -> List[str]:
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
     reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
     tld = reg["tld"]
-    # country/cities hints
     country_hint = {
         "ua-ua": "(Україна OR Ukraine OR Київ OR Lviv OR Одеса OR Dnipro OR Kharkiv)",
         "by-ru": "(Беларусь OR Belarus OR Минск)",
@@ -511,12 +507,10 @@ def _domain_explicitly_blocked(domain: str) -> bool:
         return False
 
 def domain_is_blocked(domain: str) -> bool:
-    """STRONG: блокируем если есть явный блок или любой bad за последние 60 дней."""
     if not STRONG_BLOCK_ON_BAD:
         return _domain_explicitly_blocked(domain)
     try:
-        if _domain_explicitly_blocked(domain):
-            return True
+        if _domain_explicitly_blocked(domain): return True
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             since = (datetime.utcnow() - timedelta(days=BAD_BLOCK_DAYS)).isoformat()
@@ -528,7 +522,6 @@ def domain_is_blocked(domain: str) -> bool:
         return False
 
 def domain_feedback_adjustment(domain: str) -> float:
-    """+boost за good/click, -penalty за bad; каппируем пожёстче."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -548,8 +541,7 @@ def domain_feedback_adjustment(domain: str) -> float:
 
 # ======================= Search engines =======================
 def duckduckgo_search(query, max_results=25, region="wt-wt"):
-    data_ok = _engine_allowed("ddg")
-    if not data_ok:
+    if not _engine_allowed("ddg"):
         logger.error("Daily request limit reached for DDG")
         return []
     urls = []
@@ -568,7 +560,10 @@ def duckduckgo_search(query, max_results=25, region="wt-wt"):
         return []
 
 def serpapi_search(query, max_results=25, region="wt-wt"):
+    global _last_serpapi_429_at
     if not SERPAPI_API_KEY:
+        return []
+    if (time.time() - _last_serpapi_429_at) < SERPAPI_COOLDOWN_SEC:
         return []
     if not _engine_allowed("serpapi"):
         logger.warning("Daily request limit reached for SerpAPI")
@@ -596,56 +591,48 @@ def serpapi_search(query, max_results=25, region="wt-wt"):
         _bump_counter("serpapi")
         urls = [normalize_url(u) for u in urls if not is_hard_bad_domain(domain_of(u))]
         return list(dict.fromkeys(urls))[:max_results]
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            logger.warning("SerpAPI 429: enabling cooldown")
+            _last_serpapi_429_at = time.time()
+        else:
+            logger.warning(f"SerpAPI error: {e}")
+        return []
     except Exception as e:
         logger.warning(f"SerpAPI error: {e}")
         return []
 
 # ======================= Scraping & Deep analysis =======================
 def _request_headers():
-    return {
-        "User-Agent": DEFAULT_UA,
-        "Accept-Language": random.choice(ACCEPT_LANG_POOL)
-    }
+    return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL)}
 
 def _http_get(url: str) -> Optional[requests.Response]:
     try:
         resp = requests.get(url, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
-        if resp.status_code >= 400:
-            return None
+        if resp.status_code >= 400: return None
         ct = (resp.headers.get("Content-Type","") or "").lower()
-        if "text/html" not in ct and "application/xhtml" not in ct:
-            return None
+        if "text/html" not in ct and "application/xhtml" not in ct: return None
         return resp
     except Exception:
         return None
 
 def extract_text_for_classification(html: bytes) -> Tuple[str, str, List[Tuple[str,str]]]:
-    """Возвращаем title, компактный видимый текст, и список внутренних ссылок (text, href)."""
-    if not html:
-        return "", "", []
+    if not html: return "", "", []
     enc = detect_encoding(html)
     try:
         soup = BeautifulSoup(html.decode(enc, errors="ignore"), "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
-
     for bad in soup(["script", "style", "noscript", "svg", "picture", "source"]):
         bad.decompose()
 
     title = (soup.title.string if soup.title and soup.title.string else "").strip()
-
-    meta_desc = ""
     md = soup.select_one("meta[name='description']") or soup.select_one("meta[property='og:description']")
-    if md and md.get("content"):
-        meta_desc = md["content"].strip()
-
+    meta_desc = md["content"].strip() if (md and md.get("content")) else ""
     heads = " ".join(h.get_text(" ", strip=True) for h in soup.select("h1, h2, h3")[:8])
     paras = " ".join(p.get_text(" ", strip=True) for p in soup.select("p")[:12])
+    text = re.sub(r"\s+", " ", " ".join([meta_desc, heads, paras]).strip())
 
-    text = " ".join([meta_desc, heads, paras])
-    text = re.sub(r"\s+", " ", text).strip()
-
-    # collect internal links (anchor text, href)
     links = []
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
@@ -656,60 +643,53 @@ def extract_text_for_classification(html: bytes) -> Tuple[str, str, List[Tuple[s
 
 def _absolute_url(base_url: str, href: str) -> Optional[str]:
     try:
-        if not href or href.startswith("javascript:") or href.startswith("mailto:"):
-            return None
-        if href.startswith("//"):
-            return "https:" + href
-        if bool(urlparse(href).netloc):
-            return href
-        # relative
+        if not href or href.startswith(("javascript:", "mailto:")): return None
+        if href.startswith("//"): return "https:" + href
+        if bool(urlparse(href).netloc): return href
         base = urlparse(base_url)
         base_path = base.path if base.path.endswith("/") else os.path.dirname(base.path) + "/"
-        joined = urlunparse((base.scheme, base.netloc, os.path.normpath(os.path.join(base_path, href)), "", "", ""))
-        return joined
+        return urlunparse((base.scheme, base.netloc, os.path.normpath(os.path.join(base_path, href)), "", "", ""))
     except Exception:
         return None
 
 def pick_microcrawl_targets(base_url: str, links: List[Tuple[str,str]]) -> List[str]:
-    targets = []
-    cand = []
+    targets, seen = [], set()
     for txt, href in links:
-        t = (txt or "").lower()
-        u = (href or "").lower()
-        if any(k in u for k in ("/contact","/contacts","/about","/o-nas","/about-us","/services","/solutions","/platform","/company")) \
-           or any(k in t for k in ("contact","contacts","about","о нас","services","solutions","platform","company")):
+        t = (txt or "").lower(); u = (href or "").lower()
+        if any(k in u for k in ("/contact","/contacts","/about","/about-us","/services","/solutions","/platform","/company")) \
+           or any(k in t for k in ("contact","contacts","about","services","solutions","platform","company")):
             absu = _absolute_url(base_url, href)
             if absu:
-                cand.append(absu)
-    # dedupe per path
-    seen = set()
-    for u in cand:
-        p = urlparse(u).path
-        if p not in seen:
-            targets.append(u); seen.add(p)
-        if len(targets) >= 2:  # жесткий лимит
-            break
+                p = urlparse(absu).path
+                if p not in seen:
+                    targets.append(absu); seen.add(p)
+        if len(targets) >= MAX_MICROCRAWL_PAGES: break
     return targets
 
-def fetch_one(url: str) -> Optional[Dict[str,Any]]:
+def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
     try:
         if not url or is_hard_bad_domain(domain_of(url)): return None
         if domain_is_blocked(domain_of(url)): return None
         resp = _http_get(url)
         if not resp: return None
         title, text, links = extract_text_for_classification(resp.content)
-        if not text:
+        if not text: return None
+
+        t_low = text.lower()
+        # быстрая отбраковка сетей "для вебмастеров"
+        if any(h in t_low for h in NETWORK_FOR_PUBLISHERS_HINTS):
             return None
 
-        # микрокраул (до 2 страниц)
+        # микрокраул — строго при необходимости (регион слабый или мало company-сигналов)
+        need_more_region = region_affinity_quick(url, t_low, region) < 0.6
+        need_company = not is_company_or_platform(url, t_low)
         extras_text = ""
-        for ex_url in pick_microcrawl_targets(url, links):
-            ex_resp = _http_get(ex_url)
-            if not ex_resp:
-                continue
-            _, ex_text, _ = extract_text_for_classification(ex_resp.content)
-            if ex_text:
-                extras_text += " " + short(ex_text, 1500)
+        if ENABLE_MICROCRAWL and (need_more_region or need_company):
+            for ex_url in pick_microcrawl_targets(url, links):
+                ex_resp = _http_get(ex_url)
+                if not ex_resp: continue
+                _, ex_text, _ = extract_text_for_classification(ex_resp.content)
+                if ex_text: extras_text += " " + short(ex_text, 1500)
 
         full_text = (text + " " + extras_text).strip()
         return {"url": url, "name": title or "N/A", "text": full_text}
@@ -717,31 +697,36 @@ def fetch_one(url: str) -> Optional[Dict[str,Any]]:
         return None
 
 # ======================= Classification & Scoring =======================
+CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
+
 def is_operator_program(url: str, text: str) -> bool:
-    u = url.lower()
-    t = text.lower()
-    if any(tok in u for tok in CASINO_TLDS):
-        return True
-    if any(tok in t for tok in OPERATOR_PROGRAM_HINTS):
-        return True
-    # явные домены операторов часто содержат /affiliates
+    u = url.lower(); t = text.lower()
+    if any(tok in u for tok in CASINO_TLDS): return True
+    if any(tok in t for tok in OPERATOR_PROGRAM_HINTS): return True
     if "/affiliate" in u or "/affiliates" in u:
-        # различаем платформы/агентства vs программа оператора по контенту
         if "for operators" in t or "for brands" in t or "for advertisers" in t or "platform" in t:
             return False
         return True
     return False
 
+def is_network_for_publishers(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in NETWORK_FOR_PUBLISHERS_HINTS)
+
 def is_company_or_platform(url: str, text: str) -> bool:
     t = text.lower()
-    # must-have тематические сигналы
-    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced"))
+    has_aff = any(k in t for k in ("affiliate","affiliat","партнерск","партнёрск","рефераль","opm","outsourced","program management","affiliate management"))
     has_ig  = any(k in t for k in ("igaming","i-gaming","casino","казино","гемблинг","игейминг","игемблинг","беттинг","sportsbook","bookmaker","poker","slots"))
-    if not (has_aff and has_ig):
-        return False
-    # признаки компании/сервиса
+    if not (has_aff and has_ig): return False
     has_company = any(k in t for k in COMPANY_SERVICE_HINTS)
-    return has_company
+    if not has_company: return False
+    if is_network_for_publishers(t): return False
+    return True
+
+def looks_like_job(url: str, text: str) -> bool  # (already above)  # noqa
+def looks_like_event(url: str, text: str) -> bool  # noqa
+def looks_like_directory(url: str, text: str) -> bool  # noqa
+def looks_like_blog(url: str, text: str) -> bool  # noqa
 
 def classify(url: str, text: str) -> str:
     if looks_like_job(url, text): return "jobs"
@@ -760,84 +745,60 @@ def language_ok(text: str, region: str) -> bool:
 def quality_score(url: str, text: str) -> float:
     t = text.lower()
     score = 0.0
-    # https / status assumed ok if we parsed
-    try:
-        if url.lower().startswith("https://"): score += 0.06
-    except Exception:
-        pass
-    # presence of key pages (we inferred via text)
+    if url.lower().startswith("https://"): score += 0.06
     for k in ("about","contact","services","solutions","platform","features","pricing","clients","case"):
         if k in t: score += 0.02
-    score = min(score, 0.4)
-    # freshness (скромная эвристика)
-    if re.search(r"20(2[3-5])", t):  # 2023..2025
-        score += 0.05
+    if re.search(r"20(2[3-5])", t): score += 0.05
     return min(score, 0.4)
 
+def agency_boost(text: str) -> float:
+    t = text.lower()
+    boost = 0.0
+    if "agency" in t or "агентств" in t or "opm" in t or "program management" in t: boost += 0.12
+    if "for operators" in t or "for brands" in t or "for advertisers" in t: boost += 0.08
+    if "platform" in t and "features" in t and "pricing" in t: boost -= 0.05
+    if "affiliate network" in t or is_network_for_publishers(t): boost -= 0.25
+    return max(-0.3, min(0.2, boost))
+
+def region_affinity_quick(url: str, t_low: str, region: str) -> float:
+    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"]); tld = "." + reg["tld"] if reg.get("tld") else ""
+    u = url.lower(); score = 0.0
+    if tld and u.endswith(tld): score += 0.5
+    toks = [x.lower() for x in REGION_HINTS.get(region, {}).get("tokens", [])]
+    if toks and any(tok in t_low for tok in toks): score += 0.2
+    return max(0.0, min(1.0, score))
+
 def region_affinity(url: str, text: str, region: str) -> float:
-    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
-    tld = "." + reg["tld"] if reg.get("tld") else ""
-    u = url.lower(); t = text.lower()
-    score = 0.0
-
-    # локальный tld (сильный приоритет)
-    if tld and u.endswith(tld):
-        score += 0.55
-
+    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"]); tld = "." + reg["tld"] if reg.get("tld") else ""
+    u = url.lower(); t = text.lower(); score = 0.0
+    if tld and u.endswith(tld): score += 0.55
     hints = REGION_HINTS.get(region, {})
     tokens = [x.lower() for x in hints.get("tokens", [])]
     orgs = [x.lower() for x in hints.get("org", [])]
     cities = [x.lower() for x in hints.get("cities", [])]
-
-    if tokens and any(tok in t for tok in tokens):
-        score += 0.25
-    if orgs and any(o in t for o in orgs):
-        score += 0.20
-    if cities and any(c in t for c in cities):
-        score += 0.15
-
-    # телефонные коды в контактной странице/тексте
-    rex = PHONE_CODE_RE.get(region)
-    if rex and rex.search(t):
-        score += 0.30
-
-    # валюта
-    cur = CURRENCY_HINTS.get(region)
-    if cur and any(sym.lower() in t for sym in [c.lower() for c in cur[0]]):
-        score += cur[1]
-
-    # язык
-    if language_ok(t, region):
-        score += 0.15
-    else:
-        score -= 0.30
-
-    # штраф за не-локальные без токенов
-    if tld and (not u.endswith(tld)) and not (tokens and any(tok in t for tok in tokens)):
-        score -= 0.35
-
+    if tokens and any(tok in t for tok in tokens): score += 0.25
+    if orgs and any(o in t for o in orgs): score += 0.20
+    if cities and any(c in t for c in cities): score += 0.15
+    rex = PHONE_CODE_RE.get(region);  cur = CURRENCY_HINTS.get(region)
+    if rex and rex.search(t): score += 0.30
+    if cur and any(sym.lower() in t for sym in [c.lower() for c in cur[0]]): score += cur[1]
+    if language_ok(t, region): score += 0.15
+    else: score -= 0.30
+    if tld and (not u.endswith(tld)) and not (tokens and any(tok in t for tok in tokens)): score -= 0.35
     return max(0.0, min(1.0, score))
 
 def base_relevance(text: str) -> float:
-    t = text.lower()
-    rel = 0.0
-    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced")):
-        rel += 0.4
-    if any(k in t for k in ("igaming","casino","беттинг","sportsbook","bookmaker","poker","slots","gambling")):
-        rel += 0.4
-    if any(k in t for k in ("for operators","for brands","for advertisers","clients","case study","platform","services","solutions")):
-        rel += 0.3
+    t = text.lower(); rel = 0.0
+    if any(k in t for k in ("affiliate","affiliat","партнерск","opm","outsourced","program management","affiliate management")): rel += 0.45
+    if any(k in t for k in ("igaming","casino","беттинг","sportsbook","bookmaker","poker","slots","gambling")): rel += 0.4
+    if any(k in t for k in ("for operators","for brands","for advertisers","clients","case study","platform","services","solutions")): rel += 0.25
     return max(0.0, min(1.0, rel))
 
 def score_item(url: str, text: str, region: str) -> float:
     d = domain_of(url)
-    base = base_relevance(text)
-    reg = region_affinity(url, text, region)
-    q = quality_score(url, text)
-    fb = domain_feedback_adjustment(d)
-    # penalties already handled by classifier, but keep casino tlds
-    tld_pen = -0.2 if any(url.lower().endswith(ct) for ct in CASINO_TLDS) else 0.0
-    score = 0.9*base + 1.1*reg + q + fb + tld_pen
+    score = 0.85*base_relevance(text) + 1.1*region_affinity(url, text, region) + quality_score(url, text) \
+            + domain_feedback_adjustment(d) + agency_boost(text)
+    if any(url.lower().endswith(ct) for ct in CASINO_TLDS): score -= 0.2
     return max(0.0, min(2.2, score))
 
 # ======================= Persistence =======================
@@ -861,20 +822,16 @@ def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str,
                 """INSERT OR IGNORE INTO results
                    (id, name, website, description, specialization, country, source, status, suitability, score)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    row["id"], row.get("name","N/A"), row["website"], row.get("description","N/A"),
-                    "", row.get("country","N/A"), row.get("source","Web"),
-                    "Active", "Подходит", row.get("score",0.0),
-                ),
+                (row["id"], row.get("name","N/A"), row["website"], row.get("description","N/A"),
+                 "", row.get("country","N/A"), row.get("source","Web"),
+                 "Active", "Подходит", row.get("score",0.0))
             )
             c.execute(
                 """INSERT OR IGNORE INTO results_history
                    (id, query_id, url, domain, source, score, intent_json, region, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid.uuid4()), query_id, row["website"], domain_of(row["website"]), row.get("source","Web"),
-                    row.get("score",0.0), json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat()
-                )
+                (str(uuid.uuid4()), query_id, row["website"], domain_of(row["website"]), row.get("source","Web"),
+                 row.get("score",0.0), json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat())
             )
             conn.commit()
     except Exception as e:
@@ -902,7 +859,7 @@ def save_to_csv_txt():
     except Exception as e:
         logger.error(f"Export failed: {e}")
 
-# ======================= Pipeline helpers =======================
+# ======================= Pipeline =======================
 def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
     if region not in REGION_MAP:
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
@@ -915,82 +872,71 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
 
 def collect_urls(web_queries: List[str], region: str, engine: str, per_query_k: int) -> List[str]:
     all_urls: List[str] = []
+
+    # 1) Всегда сначала DDG (основной)
     for q in web_queries:
         all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region))
-        if engine in ("serpapi","both") and SERPAPI_API_KEY:
+
+    # 2) SerpAPI — только если мало URL и нет cooldown
+    need_fallback = (engine in ("serpapi","both")) and SERPAPI_API_KEY and (len(all_urls) < MIN_RESULTS * 3)
+    if need_fallback:
+        for q in web_queries:
             all_urls.extend(serpapi_search(q, max_results=per_query_k, region=region))
-    # dedupe and preblock
-    deduped = []
-    seen = set()
+            if len(all_urls) >= MAX_RESULTS * 10:
+                break
+
+    deduped, seen = [], set()
     for u in all_urls:
-        if not u or u in seen:
-            continue
+        if not u or u in seen: continue
         d = domain_of(u)
-        if is_hard_bad_domain(d):
-            continue
-        if STRONG_BLOCK_ON_BAD and domain_is_blocked(d):
-            continue
+        if is_hard_bad_domain(d): continue
+        if STRONG_BLOCK_ON_BAD and domain_is_blocked(d): continue
         deduped.append(normalize_url(u)); seen.add(u)
     return deduped
 
 def _prefilter_url(url: str, name: str, text: str) -> Optional[str]:
-    # Мгновенные отсеки мусора
     if looks_like_job(url, text): return "jobs"
     if looks_like_event(url, text): return "event"
     if looks_like_directory(url, text): return "directory"
     if looks_like_blog(url, text): return "blog"
+    if is_network_for_publishers(text): return "network_for_publishers"
     if is_operator_program(url, text): return "operator_program"
     return None
 
 def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []
 
-    # per-host limit
     per_host_counter: Dict[str,int] = {}
     filtered_urls = []
     for u in urls:
         dom = domain_of(u)
-        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom):
-            continue
-        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT:
-            continue
+        if STRONG_BLOCK_ON_BAD and domain_is_blocked(dom): continue
+        if per_host_counter.get(dom, 0) >= PER_HOST_LIMIT: continue
         per_host_counter[dom] = per_host_counter.get(dom, 0) + 1
         filtered_urls.append(u)
 
     reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
     tld = "." + reg["tld"] if reg.get("tld") else ""
 
-    stage_counts = {"fetched":0,"prefilter_pass":0,"classified_ok":0}
+    start_ts = time.time()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut2url = {ex.submit(fetch_one, u): u for u in filtered_urls}
+        fut2url = {ex.submit(fetch_one, u, region): u for u in filtered_urls}
         for fut in as_completed(fut2url):
+            if (time.time() - start_ts) > SCRAPE_HARD_DEADLINE_SEC:
+                logger.warning("Scrape deadline reached, stopping further processing")
+                break
             item = fut.result()
-            if not item:
-                continue
+            if not item: continue
             url = item["url"]; name = item["name"]; text = item["text"]
-            stage_counts["fetched"] += 1
 
-            # предфильтр
             bad_reason = _prefilter_url(url, name, text)
-            if bad_reason:
-                continue
+            if bad_reason: continue
 
-            # тематический классификатор (жёстко)
-            cls = classify(url, text)
-            if cls not in ("company_or_platform",):
-                # операторские и информация/мусор — исключаем
-                continue
+            if classify(url, text) != "company_or_platform": continue
+            if not language_ok(text, region): continue
 
-            # языковой фильтр
-            if not language_ok(text, region):
-                continue
-
-            stage_counts["classified_ok"] += 1
-
-            # скоринг
             score = score_item(url, text, region)
-
             results.append({
                 "id": str(uuid.uuid4()),
                 "name": name or "N/A",
@@ -1001,7 +947,7 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
                 "score": score
             })
 
-    # дедуп по домену (не более 1 результата на домен, изредка 2 если сильная разница в score)
+    # Дедуп по домену: 1 (редко 2) записи
     by_domain: Dict[str, List[Dict[str,Any]]] = {}
     for r in results:
         d = domain_of(r["website"])
@@ -1014,29 +960,31 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
             keep.append(items[1])
         compact.extend(keep)
 
-    # приоритет: сначала локальные (region-heavy mixing)
+    # Региональный приоритет — динамический
     if tld:
         local = [r for r in compact if r["website"].lower().endswith(tld) or region_affinity(r["website"], r["description"], region) >= 0.6]
         global_ = [r for r in compact if r not in local]
         local.sort(key=lambda x: x["score"], reverse=True)
         global_.sort(key=lambda x: x["score"], reverse=True)
-        # enforce ≥70% региональных, если есть
-        want_local = max(int(0.7 * MAX_RESULTS), MIN_RESULTS // 2)
-        head = local[:want_local]
-        tail = (local[want_local:] + global_)
-        results_final = head + tail
+        local_count = len(local)
+        dynamic_local_share = 0.7 if local_count >= MIN_RESULTS else 0.5
+        want_local = max(int(dynamic_local_share * MAX_RESULTS), MIN_RESULTS // 2)
+        results_final = (local[:want_local]) + (local[want_local:] + global_)
     else:
         results_final = sorted(compact, key=lambda x: x["score"], reverse=True)
 
-    # обрезаем до MAX_RESULTS
-    results_final = results_final[:MAX_RESULTS]
-    return results_final
+    return results_final[:MAX_RESULTS]
 
-def escalate_if_needed(results: List[Dict[str,Any]], urls: List[str], region: str) -> List[Dict[str,Any]]:
-    """Если < MIN_RESULTS, делаем второй проход c ослаблением регион-порога и добор из хвоста."""
+def escalate_if_needed(results: List[Dict[str,Any]], urls: List[str], region: str, engine: str, per_query_k: int, user_prompt: str) -> List[Dict[str,Any]]:
     if len(results) >= MIN_RESULTS:
         return results
-    more = scrape_parallel(urls[400:1000], region)  # хвост
+    # Мягкая эскалация: новые запросы без site:.tld, но с country tokens
+    geo_queries_soft = apply_geo_bias(build_core_queries(user_prompt), region)
+    geo_queries_soft = [q for i,q in enumerate(geo_queries_soft) if i not in (1,2)]
+    more_urls = collect_urls([with_intent_filters(q, detect_intent(user_prompt)) for q in geo_queries_soft], region, engine, per_query_k)
+    merged = list(dict.fromkeys(urls + more_urls))
+    more = scrape_parallel(merged[len(urls):len(urls)+600], region)
+
     known = set(r["website"] for r in results)
     for r in more:
         if r["website"] not in known:
@@ -1059,42 +1007,34 @@ def search():
         data = request.json or {}
         user_query = data.get("query", "").strip()
         region = data.get("region", "wt-wt")
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE","both")).lower()  # ddg | serpapi | both
-        per_query_k = int(data.get("per_query", 25))  # берём побольше с каждого запроса
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE","ddg")).lower()  # ddg по умолчанию
+        per_query_k = int(data.get("per_query", 25))
 
         if not user_query:
             return jsonify({"error":"Query is required"}), 400
 
         logger.info(f"API request: query='{user_query}', region={region}, engine={engine}")
 
-        # очистка текущей таблицы результатов
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute("DELETE FROM results")
             conn.commit()
 
-        # генерим подзапросы
         web_queries, phrases, region, intent = generate_search_queries(user_query, region)
-
-        # пишем запрос
         query_id = insert_query_record(user_query, intent, region)
 
-        # собираем URL’ы
         urls = collect_urls(web_queries, region, engine, per_query_k=per_query_k)
         logger.info(f"Pre-filtered URLs (unique & not blocked): {len(urls)}")
 
-        # 1-й проход
         t0 = time.time()
         web_results = scrape_parallel(urls[:400], region)
 
-        # если мало — эскалация по хвосту
-        if len(web_results) < MIN_RESULTS and len(urls) > 400:
-            web_results = escalate_if_needed(web_results, urls, region)
+        if len(web_results) < MIN_RESULTS:
+            web_results = escalate_if_needed(web_results, urls, region, engine, per_query_k, user_query)
 
         dt = time.time() - t0
         logger.info(f"Scraped {len(web_results)} results in {dt:.2f}s")
 
-        # запись в БД + экспорт
         save_to_db_and_files(web_results, intent, region, query_id)
 
         return jsonify({
@@ -1128,13 +1068,12 @@ def feedback():
                          VALUES (?, ?, ?, ?, ?, ?, ?)""",
                       (str(uuid.uuid4()), query_id, url, dom, action, weight, datetime.utcnow().isoformat()))
             conn.commit()
-        # немедленная блокировка при bad
         if action == "bad":
             _block_domain(dom, reason="user_bad", days=BAD_BLOCK_DAYS)
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"/feedback error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}"), 500
 
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
