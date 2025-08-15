@@ -198,12 +198,18 @@ BAD_DOMAINS_HARD = {
     "google.com","maps.google.com","baidu.com","zhihu.com","commentcamarche.net",
     "xnxx.com","pornhub.com","hometubeporn.com","porn7.xxx","fuckvideos.xxx",
 }
-# мягкий блэклист: статьи/словари/форумы (но не железно отсекаем)
+
+# мягкий блэклист: мусор/агрегаторы/несвязанные
+SOFT_BAD_DOMAINS = {
+    "hostadvice.com","stalkeruz.com","support.google.com","youtube.com","m.youtube.com",
+    "coinspaid.com","coinspaid.media","vc.ru","habr.com","marketer.ua",
+    "influencermarketinghub.com","timesofcasino.com","thebetting.net","cashradar.ru",
+    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org",
+}
+
 KNOWLEDGE_DOMAINS = {
-    "wikipedia.org","en.wikipedia.org","ru.wikipedia.org","hubspot.com","coursera.org",
-    "ibm.com","sproutsocial.com","digitalmarketinginstitute.com","marketermilk.com",
-    "harvard.edu","professional.dce.harvard.edu","medium.com","vc.ru","sendx.io",
-    "provsе.***","marketer.ua","affiverse.com","news.ycombinator.com","habr.com"
+    "hubspot.com","coursera.org","ibm.com","sproutsocial.com","digitalmarketinginstitute.com",
+    "harvard.edu","professional.dce.harvard.edu","medium.com","sendx.io","news.ycombinator.com",
 }
 
 COMPANY_URL_TOKENS = [
@@ -307,45 +313,66 @@ def _save_request_count(count):
 # ======================= Search Engines =======================
 from ddgs import DDGS
 
+# Расширенная карта регионов с google_domain и tld
 REGION_MAP = {
-    "wt-wt": {"hl": "en", "gl": "us"},
-    "us-en": {"hl": "en", "gl": "us"},
-    "uk-en": {"hl": "en", "gl": "gb"},
-    "de-de": {"hl": "de", "gl": "de"},
-    "fr-fr": {"hl": "fr", "gl": "fr"},
-    "ru-ru": {"hl": "ru", "gl": "ru"},
-    "ua-ua": {"hl": "uk", "gl": "ua"},
-    "kz-ru": {"hl": "ru", "gl": "kz"},
-    "by-ru": {"hl": "ru", "gl": "by"},
-    "tr-tr": {"hl": "tr", "gl": "tr"},
-    "ae-en": {"hl": "en", "gl": "ae"},
-    "in-en": {"hl": "en", "gl": "in"},
-    "sg-en": {"hl": "en", "gl": "sg"},
-    "es-es": {"hl": "es", "gl": "es"},
-    "it-it": {"hl": "it", "gl": "it"},
-    "nl-nl": {"hl": "nl", "gl": "nl"},
-    "se-sv": {"hl": "sv", "gl": "se"},
-    "no-no": {"hl": "no", "gl": "no"},
-    "fi-fi": {"hl": "fi", "gl": "fi"},
-    "cz-cs": {"hl": "cs", "gl": "cz"},
-    "sk-sk": {"hl": "sk", "gl": "sk"},
-    "ro-ro": {"hl": "ro", "gl": "ro"},
-    "hu-hu": {"hl": "hu", "gl": "hu"},
-    "ch-de": {"hl": "de", "gl": "ch"},
-    "br-pt": {"hl": "pt", "gl": "br"},
-    "mx-es": {"hl": "es", "gl": "mx"},
-    "au-en": {"hl": "en", "gl": "au"},
-    "nz-en": {"hl": "en", "gl": "nz"},
+    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com"},
+    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us"},
+    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk"},
+    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de"},
+    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr"},
+    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.ru", "tld": "ru"},
+    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com.ua", "tld": "ua"},
+    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.kz", "tld": "kz"},
+    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.by", "tld": "by"},
+    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr"},
+    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae"},
+    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in"},
+    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg"},
+    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es"},
+    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it"},
+    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl"},
+    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se"},
+    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no"},
+    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi"},
+    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz"},
+    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk"},
+    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro"},
+    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu"},
+    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch"},
+    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br"},
+    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx"},
+    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au"},
+    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
+}
+
+# Гео-экстра: токены городов/организационно-правовых форм
+REGION_EXTRAS = {
+    "kz-ru": {"tokens": ["Казахстан","Алматы","Алма-Ата","Astana","Нур-Султан","KZ","Kazakhstan"], "tld": "kz", "org_tokens": ["ТОО","LLP","ИП","ЖШС"]},
+    "ru-ru": {"tokens": ["Россия","Москва","Санкт-Петербург","RF"], "tld": "ru", "org_tokens": ["ООО","АО","ИП"]},
+    "ua-ua": {"tokens": ["Україна","Київ","Lviv","Odessa"], "tld": "ua", "org_tokens": ["ТОВ","ФОП"]},
+    "by-ru": {"tokens": ["Беларусь","Минск"], "tld": "by", "org_tokens": ["ООО","ЧУП"]},
+    "tr-tr": {"tokens": ["Türkiye","Istanbul","Ankara"], "tld": "tr", "org_tokens": ["AŞ","Ltd. Şti."]},
+    "ae-en": {"tokens": ["UAE","Dubai","Abu Dhabi"], "tld": "ae", "org_tokens": ["LLC","FZ-LLC"]},
+    "in-en": {"tokens": ["India","Delhi","Bengaluru","Mumbai"], "tld": "in", "org_tokens": ["Pvt Ltd","LLP"]},
+    "uk-en": {"tokens": ["United Kingdom","London","UK"], "tld": "uk", "org_tokens": ["Ltd","LLP"]},
+    "us-en": {"tokens": ["USA","United States","New York","San Francisco"], "tld": "us", "org_tokens": ["LLC","Inc"]},
+    # можно добавлять дальше по мере надобности
 }
 
 def with_intent_filters(q: str, intent: Dict[str,bool]) -> str:
+    """
+    Мягкая фильтрация: отсекаем справочники/вики и вакансии.
+    Для бизнес-запросов добавляем лёгкие минус-слова: news|review|forum|guide.
+    """
     parts = [q]
-    # лёгкая фильтрация, НЕ душим выдачу
     if intent.get("business"):
         parts.append("-site:wikipedia.org")
+        parts += ["-news", "-forum", "-форум", "-guide"]
     if intent.get("affiliate") and intent.get("casino"):
         parts += ["-site:askgamblers.com", "-site:casino.org", "-site:bonusfinder.com"]
         parts += ["-вакансии","-вакансия","-работа","-hh.ru","-job","-jobs","-career"]
+        # режем обзорники по ключам только если это не убьёт выдачу: лёгкий минус
+        parts += ["-\"what is\"", "-\"что такое\"", "-glossary"]
     query = " ".join(parts)
     if len(query) > 500:
         query = " ".join(parts[:6])
@@ -356,7 +383,8 @@ def duckduckgo_search(query, max_results=15, region="wt-wt", intent=None, force_
     if data["count"] >= DAILY_REQUEST_LIMIT:
         logger.error("Daily request limit reached")
         return []
-    real_region = "ru-ru" if force_ru_ddg else region
+    # не переезжаем насильно в ru-ru, если выбран конкретный регион
+    real_region = "ru-ru" if (force_ru_ddg and region == "wt-wt") else region
     q = with_intent_filters(query, intent or {"business": True})
     logger.info(f"DDG search: '{q}' region={real_region}")
     urls = []
@@ -378,16 +406,30 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent=None):
     if not SERPAPI_API_KEY:
         return []
     q = with_intent_filters(query, intent or {"business": True})
-    params = {"engine": "google", "q": q, "num": max_results, "api_key": SERPAPI_API_KEY}
-    params.update(REGION_MAP.get(region, REGION_MAP["wt-wt"]))
-    logger.info(f"SerpAPI search: '{q}' region={region}")
+    reg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
+    params = {
+        "engine": "google",
+        "q": q,
+        "num": max_results,
+        "api_key": SERPAPI_API_KEY,
+        "hl": reg["hl"],
+        "gl": reg["gl"],
+        "google_domain": reg["google_domain"],
+    }
+    # Подскажем локацию для локальных SERP (если есть экстра токены)
+    if region in REGION_EXTRAS:
+        params["location"] = REGION_EXTRAS[region]["tokens"][0]
+    logger.info(f"SerpAPI search: '{q}' region={region} domain={reg['google_domain']}")
     try:
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        urls = [it.get("link") for it in data.get("organic_results", [])[:max_results] if it.get("link")]
-        for it in data.get("inline_results", []):
-            if it.get("link"): urls.append(it["link"])
+        urls = [it.get("link") for it in data.get("organic_results", []) if it.get("link")]
+        # Дополнительно: inline/local/shopping — иногда ведут на сайты компаний
+        for block in ("inline_results","local_results","shopping_results","top_stories"):
+            for it in data.get(block, []) or []:
+                link = it.get("link") or it.get("source")
+                if link: urls.append(link)
         time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
         urls = [u for u in urls if not is_hard_bad_domain(domain_of(u))]
         return list(dict.fromkeys(urls))[:max_results]
@@ -397,30 +439,36 @@ def serpapi_search(query, max_results=15, region="wt-wt", intent=None):
 
 # ======================= Query expansion =======================
 def apply_geo_bias(queries: List[str], region: str) -> List[str]:
-    # мягкий биас: site:.tld + добавка страны в первый запрос
-    GEO_HINTS = {
-        "ru-ru": {"tld": "ru", "tokens": ["Россия","Москва"]},
-        "ua-ua": {"tld": "ua", "tokens": ["Україна","Київ"]},
-        "by-ru": {"tld": "by", "tokens": ["Беларусь","Минск"]},
-        "kz-ru": {"tld": "kz", "tokens": ["Казахстан","Алматы"]},
-        "us-en": {"tld": "us", "tokens": ["USA","United States"]},
-        "uk-en": {"tld": "uk", "tokens": ["United Kingdom","London"]},
-    }
-    hint = GEO_HINTS.get(region)
-    if not hint: return queries
-    tld = hint["tld"]; tokens = hint["tokens"]
+    """
+    Добавляем гео-подсказки:
+      1) +токены страны/городов в первый запрос
+      2) site:.tld во второй
+      3) site:*.tld в третий
+    """
+    hint = REGION_EXTRAS.get(region)
+    cfg = REGION_MAP.get(region, REGION_MAP["wt-wt"])
+    if not hint:
+        return queries
+    tld = hint.get("tld", cfg.get("tld", "com"))
+    tokens = hint.get("tokens", [])
     out = []
-    for i,q in enumerate(queries):
-        if i == 0: out.append(f"{q} {' '.join(tokens)}")
-        elif i == 1: out.append(f"{q} site:.{tld}")
-        else: out.append(q)
+    for i, q in enumerate(queries):
+        if i == 0:
+            out.append(f"{q} {' '.join(tokens)}")
+        elif i == 1:
+            out.append(f"{q} site:.{tld}")
+        elif i == 2:
+            out.append(f"{q} site:*.{tld}")
+        else:
+            out.append(q)
     return out
 
-def fallback_expand_queries(user_prompt: str, intent: Dict[str,bool]) -> List[str]:
+def fallback_expand_queries(user_prompt: str, intent: Dict[str,bool], region: str = "wt-wt") -> List[str]:
     base = user_prompt.strip()
     qs = [base]
-    if intent.get("affiliate") and intent.get("casino"):
-        qs += [
+    casino_aff = intent.get("affiliate") and intent.get("casino")
+    if casino_aff:
+        core = [
             "casino affiliate marketing agency",
             "igaming affiliate management company",
             "casino affiliate program management",
@@ -429,19 +477,31 @@ def fallback_expand_queries(user_prompt: str, intent: Dict[str,bool]) -> List[st
             "casino affiliate network management",
             "igaming growth agency affiliates",
             "casino performance marketing agency affiliates",
-            "игейминг аффилиат агентство",
+            "casino affiliate platform for operators",
+            "partner program setup for casino",
+        ]
+        local = [
             "агентство по аффилиат маркетингу казино",
             "управление партнерской программой казино",
-            "агентство OPM казино",
-            "casino affiliate platform for operators",
-            "partner program setup for casino"
+            "игейминг аффилиат агентство",
         ]
+        # локализация для выбранного региона
+        if region in REGION_EXTRAS:
+            loc = REGION_EXTRAS[region]
+            tkns = loc.get("tokens", [])
+            tld = loc.get("tld", "")
+            cities = " ".join(tkns[:2]) if tkns else ""
+            local += [
+                f"casino affiliate agency {cities}".strip(),
+                f"affiliate marketing agency site:.{tld}".strip() if tld else "",
+                f"igaming affiliate agency {cities}".strip(),
+            ]
+        qs += [x for x in core + local if x]
     else:
         qs += [
             f"{base} agency", f"{base} services", f"{base} company", f"{base} companies",
             f"{base} directory", f"{base} providers",
         ]
-    # удаляем дубликаты
     return list(dict.fromkeys(qs))
 
 def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str], List[str], str, Dict[str,bool]]:
@@ -449,8 +509,7 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         logger.warning(f"Invalid region {region}, defaulting to wt-wt")
         region = "wt-wt"
     intent = detect_intent(user_prompt)
-    # пробуем Gemini (если есть), иначе fallback
-    queries = []
+    queries: List[str] = []
     if GEMINI_API_KEY:
         try:
             body = {
@@ -484,19 +543,33 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
         except Exception as e:
             logger.warning(f"Gemini failed: {e}")
     if not queries:
-        queries = fallback_expand_queries(user_prompt, intent)
+        queries = fallback_expand_queries(user_prompt, intent, region)
     queries = apply_geo_bias(queries, region)
+    logger.info(f"Region applied: {region}; geo-bias tld=.{REGION_MAP.get(region,{}).get('tld','com')}; queries={len(queries)}")
     return queries, queries, region, intent
 
 # ======================= Ranking & Extraction =======================
 AGENCY_TOKENS_TEXT = {
     "agency","агентство","services","услуги","clients","клиенты","cases","кейсы",
     "affiliate management","opm","partner program","igaming","casino affiliate","acquisition",
-    "performance marketing","traffic","media buying","рост","growth","agency partners","managers"
+    "performance marketing","traffic","media buying","рост","growth","agency partners","managers",
+    "solutions","partners","platform","networks"
+}
+
+SOCIAL_OK = {
+    "linkedin.com","www.linkedin.com",
+    "instagram.com","www.instagram.com",
+    "facebook.com","www.facebook.com",
+    "x.com","twitter.com","www.twitter.com"
 }
 
 def is_company_like(url: str, text: str) -> bool:
     u = (url or "").lower(); t = (text or "").lower()
+    dom = domain_of(u)
+    if dom in SOCIAL_OK:
+        strong = ["affiliate","igaming","casino","agency","partners","network","опм","агентство","аффилиат","партнерская"]
+        if any(tok in t for tok in strong) or any(tok in u for tok in strong):
+            return True
     if any(tok in u for tok in COMPANY_URL_TOKENS): return True
     if any(tok in u for tok in ["/about","/services","/partners","/program","/contact"]): return True
     if any(tok in t for tok in AGENCY_TOKENS_TEXT): return True
@@ -513,20 +586,39 @@ def looks_like_job_like(url: str) -> bool:
 def rank_result(description: str, phrases: List[str], url: Optional[str], region: str, boosts: Dict[str,float]) -> float:
     d = (description or "").lower()
     score = 0.0
+    # матчи по фразам и словам
     for p in phrases:
         p = p.lower()
-        if p and p in d: score += 0.25
+        if p and p in d: score += 0.22
         for w in p.split():
-            if len(w) > 3 and w in d: score += 0.12
+            if len(w) > 3 and w in d: score += 0.10
+
     if url:
         u = url.lower()
-        if is_company_like(u, d): score += 0.35
-        if looks_like_blog_like(u): score -= 0.25
-        if looks_like_job_like(u): score -= 0.6
         dom = domain_of(url)
+
+        # мягкий штраф мусорных/нецелевых доменов
+        if dom in SOFT_BAD_DOMAINS or dom in KNOWLEDGE_DOMAINS:
+            score -= 0.35
+
+        if is_company_like(u, d): score += 0.40
+        if looks_like_blog_like(u): score -= 0.22
+        if looks_like_job_like(u): score -= 0.60
+
         score += boosts.get(dom, 0.0)
         score -= domain_penalty(dom)
-        if any(u.endswith(t) for t in CASINO_TLDS): score -= 0.4  # сайты операторов казино — не агентства
+
+        # сайты операторов казино — не агентства
+        if any(u.endswith(t) for t in CASINO_TLDS): score -= 0.25
+
+        # локальный бонус за tld/упоминания страны/городов
+        reg_extras = REGION_EXTRAS.get(region, {})
+        tld = "." + reg_extras.get("tld", REGION_MAP.get(region, REGION_MAP["wt-wt"]).get("tld",""))
+        if tld and u.endswith(tld): score += 0.25
+        for tok in reg_extras.get("tokens", []):
+            if tok and tok.lower() in d:
+                score += 0.08
+
     score = max(0.0, min(score, 1.0))
     return score
 
@@ -551,7 +643,7 @@ def fetch_one(url: str) -> Optional[Dict[str,str]]:
         headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "en,ru;q=0.9"}
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code >= 400: return None
-        ct = resp.headers.get("Content-Type","").lower()
+        ct = (resp.headers.get("Content-Type","") or "").lower()
         if "text/html" not in ct and "application/xhtml" not in ct:
             return None
         soup = BeautifulSoup(resp.content, "html.parser")
@@ -633,7 +725,7 @@ def collect_urls(web_queries: List[str], region: str, intent: Dict[str,bool], en
         # SerpAPI (если включён)
         if engine in ("serpapi","both") and SERPAPI_API_KEY:
             all_urls.extend(serpapi_search(q, max_results=per_query_k, region=region, intent=intent))
-    # дедуп
+    # дедуп + блокировки
     deduped = []
     seen = set()
     for u in all_urls:
@@ -646,6 +738,8 @@ def collect_urls(web_queries: List[str], region: str, intent: Dict[str,bool], en
 
 def scrape_parallel(urls: List[str], phrases: List[str], region: str, boosts: Dict[str,float]) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []
+    maybe_results: List[Tuple[str,float,str,str]] = []  # tag, score, name, url, desc (храним для добора)
+
     # per host limit
     per_host_counter: Dict[str,int] = {}
     filtered_urls = []
@@ -664,18 +758,49 @@ def scrape_parallel(urls: List[str], phrases: List[str], region: str, boosts: Di
             url = item["url"]
             name = item["name"]
             desc = item["description"]
-            # ранжирование
             sc = rank_result(desc, phrases, url, region, boosts)
-            # мягкая отсечка статей/обзоров — но не убиваем потенциально годные лендинги
             u = url.lower()
-            if any(tok in u for tok in ["/review","/reviews","/rating","/best"]) and sc < 0.55:
-                continue
-            if looks_like_blog_like(u) and sc < 0.55:
-                continue
-            if looks_like_job_like(u):
-                continue
+
+            is_dir_like = any(tok in u for tok in ["directory","/list","/listing","/rank","/top","/best","/reviews","/review","/rating","/comparison","compare"])
+            is_blog = looks_like_blog_like(u)
+            is_job = looks_like_job_like(u)
+
+            keep = True
+            tag = "ok"
+            if is_job:
+                keep = False
+            elif is_dir_like and sc < 0.62:
+                keep = False
+                tag = "maybe"
+            elif is_blog and sc < 0.58:
+                keep = False
+                tag = "maybe"
             if looks_like_sports_trash(name + " " + desc):
-                continue
+                keep = False
+
+            row = {
+                "id": str(uuid.uuid4()),
+                "name": name or "N/A",
+                "website": url,
+                "description": desc or "N/A",
+                "country": "N/A",
+                "source": "Web",
+                "score": sc
+            }
+
+            if keep:
+                results.append(row)
+            else:
+                if tag == "maybe":
+                    maybe_results.append(("maybe", sc, name, url, desc))
+
+    # сортируем
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    # добираем минимум из "maybe"
+    if len(results) < MIN_RESULTS and maybe_results:
+        maybe_results.sort(key=lambda t: t[1], reverse=True)
+        for _, sc, name, url, desc in maybe_results:
             results.append({
                 "id": str(uuid.uuid4()),
                 "name": name or "N/A",
@@ -685,15 +810,14 @@ def scrape_parallel(urls: List[str], phrases: List[str], region: str, boosts: Di
                 "source": "Web",
                 "score": sc
             })
-    # сортируем
-    results.sort(key=lambda x: x["score"], reverse=True)
+            if len(results) >= MIN_RESULTS:
+                break
+
     return results
 
 def ensure_minimum(results: List[Dict[str,Any]], target_min: int) -> List[Dict[str,Any]]:
-    if len(results) >= target_min:
-        return results
-    # если мало — ослабим пороги: просто доберём хвост с более низким score (мы уже не удаляем их тут)
-    return results  # уже ослабили до этого — добирать нечего: оставляем как есть
+    # добор уже выполняется в scrape_parallel через maybe-блок; здесь просто возвращаем
+    return results
 
 # ======================= API =======================
 @app.route("/search", methods=["POST", "OPTIONS"])
@@ -729,6 +853,7 @@ def search():
 
         # если кириллица и регион дефолтный — используем ru-ru для DDG
         force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
+        logger.info(f"force_ru_ddg={force_ru_ddg} (query_has_cyrillic={is_cyrillic(user_query)})")
 
         # собираем URL’ы
         urls = collect_urls(web_queries, region, intent, engine, force_ru_ddg, per_query_k=10)
