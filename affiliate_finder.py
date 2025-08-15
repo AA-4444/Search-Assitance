@@ -19,18 +19,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from ddgs import DDGS
 
-# ========== Silence noisy warnings (Unicode/BS)
 warnings.filterwarnings("ignore", category=UserWarning, module="bs4")
-
-# ========= Optional libs (present in env)
-try:
-    from langdetect import detect as langdetect_detect
-except Exception:
-    langdetect_detect = None
-try:
-    import chardet
-except Exception:
-    chardet = None
 
 # ======================= Config & Env =======================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,15 +30,15 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_KEY", "").strip() or None
 
 MIN_RESULTS = int(os.getenv("MIN_RESULTS", "25"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "24"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "7"))
 PER_HOST_LIMIT = int(os.getenv("PER_HOST_LIMIT", "2"))
 STRONG_BLOCK_ON_BAD = (os.getenv("STRONG_BLOCK_ON_BAD", "true").lower() == "true")
 
 REQUEST_COUNT_FILE = "request_count.json"
 DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1200"))
-REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.12"))
-REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.3"))
+REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.10"))
+REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "0.25"))
 
 DEFAULT_UA = os.getenv(
     "SCRAPER_UA",
@@ -57,14 +46,11 @@ DEFAULT_UA = os.getenv(
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
 
-# SerpAPI только резерв + cooldown при 429
-SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 минут
+SERPAPI_COOLDOWN_SEC = int(os.getenv("SERPAPI_COOLDOWN_SEC", "900"))  # 15 min
 _last_serpapi_429_at = 0.0
 
-# Жёсткий дедлайн на скрапинг
-SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "180"))  # 3 минуты
+SCRAPE_HARD_DEADLINE_SEC = int(os.getenv("SCRAPE_HARD_DEADLINE_SEC", "210"))
 
-# Микрокраул — максимально бережный
 MAX_MICROCRAWL_PAGES = int(os.getenv("MAX_MICROCRAWL_PAGES", "1"))
 ENABLE_MICROCRAWL = (os.getenv("ENABLE_MICROCRAWL", "true").lower() == "true")
 
@@ -83,13 +69,8 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:8080",
     "https://search-assistance-production.up.railway.app",
 }
-CORS(
-    app,
-    origins=list(ALLOWED_ORIGINS),
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    supports_credentials=True,
-)
+CORS(app, origins=list(ALLOWED_ORIGINS), methods=["GET","POST","OPTIONS"],
+     allow_headers=["Content-Type","Authorization"], supports_credentials=True)
 
 @app.after_request
 def add_cors_headers(resp):
@@ -110,7 +91,7 @@ PHONE_CODE_RE = {
     "kz-ru": re.compile(r"(\+?7[\s\-]?\(?7\d\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
     "ua-ua": re.compile(r"(\+?380[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
     "ru-ru": re.compile(r"(\+?7[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
-    "by-ru": re.compile(r"(\+?375[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})"),
+    "by-ru": re.compile(r"(\+?375[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\с\-]?\д{2}[\с\-]?\д{2})"),
 }
 CURRENCY_HINTS = {
     "kz-ru": (("₸","KZT"), 0.25),
@@ -152,24 +133,18 @@ def short(s: str, n=220) -> str:
 def guess_lang(text: str) -> str:
     t = (text or "").strip()
     if not t: return "en"
-    # Быстрые эвристики
     if re.search(r"[іїєґ]", t.lower()): return "uk"
     if re.search(r"[а-яё]", t.lower()): return "ru"
-    if langdetect_detect:
-        try:
-            return langdetect_detect(t)
-        except Exception:
-            pass
     return "en"
 
 def detect_encoding(content: bytes) -> str:
     if not content: return "utf-8"
-    if chardet:
-        try:
-            enc = chardet.detect(content).get("encoding")
-            if enc: return enc
-        except Exception:
-            pass
+    try:
+        import chardet
+        enc = chardet.detect(content).get("encoding")
+        if enc: return enc
+    except Exception:
+        pass
     return "utf-8"
 
 # ======================= DB =======================
@@ -240,65 +215,57 @@ init_db()
 
 # ======================= Regions =======================
 REGION_MAP = {
-    "wt-wt": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "com"},
-    "us-en": {"hl": "en", "gl": "us", "google_domain": "google.com", "tld": "us"},
-    "uk-en": {"hl": "en", "gl": "gb", "google_domain": "google.co.uk", "tld": "uk"},
-    "de-de": {"hl": "de", "gl": "de", "google_domain": "google.de", "tld": "de"},
-    "fr-fr": {"hl": "fr", "gl": "fr", "google_domain": "google.fr", "tld": "fr"},
-    "ru-ru": {"hl": "ru", "gl": "ru", "google_domain": "google.ru", "tld": "ru"},
-    "ua-ua": {"hl": "uk", "gl": "ua", "google_domain": "google.com.ua", "tld": "ua"},
-    "kz-ru": {"hl": "ru", "gl": "kz", "google_domain": "google.kz", "tld": "kz"},
-    "by-ru": {"hl": "ru", "gl": "by", "google_domain": "google.by", "tld": "by"},
-    "tr-tr": {"hl": "tr", "gl": "tr", "google_domain": "google.com.tr", "tld": "tr"},
-    "ae-en": {"hl": "en", "gl": "ae", "google_domain": "google.ae", "tld": "ae"},
-    "in-en": {"hl": "en", "gl": "in", "google_domain": "google.co.in", "tld": "in"},
-    "sg-en": {"hl": "en", "gl": "sg", "google_domain": "google.com.sg", "tld": "sg"},
-    "es-es": {"hl": "es", "gl": "es", "google_domain": "google.es", "tld": "es"},
-    "it-it": {"hl": "it", "gl": "it", "google_domain": "google.it", "tld": "it"},
-    "nl-nl": {"hl": "nl", "gl": "nl", "google_domain": "google.nl", "tld": "nl"},
-    "se-sv": {"hl": "sv", "gl": "se", "google_domain": "google.se", "tld": "se"},
-    "no-no": {"hl": "no", "gl": "no", "google_domain": "google.no", "tld": "no"},
-    "fi-fi": {"hl": "fi", "gl": "fi", "google_domain": "google.fi", "tld": "fi"},
-    "cz-cs": {"hl": "cs", "gl": "cz", "google_domain": "google.cz", "tld": "cz"},
-    "sk-sk": {"hl": "sk", "gl": "sk", "google_domain": "google.sk", "tld": "sk"},
-    "ro-ro": {"hl": "ro", "gl": "ro", "google_domain": "google.ro", "tld": "ro"},
-    "hu-hu": {"hl": "hu", "gl": "hu", "google_domain": "google.hu", "tld": "hu"},
-    "ch-de": {"hl": "de", "gl": "ch", "google_domain": "google.ch", "tld": "ch"},
-    "br-pt": {"hl": "pt", "gl": "br", "google_domain": "google.com.br", "tld": "br"},
-    "mx-es": {"hl": "es", "gl": "mx", "google_domain": "google.com.mx", "tld": "mx"},
-    "au-en": {"hl": "en", "gl": "au", "google_domain": "google.com.au", "tld": "au"},
-    "nz-en": {"hl": "en", "gl": "nz", "google_domain": "google.co.nz", "tld": "nz"},
+    "wt-wt": {"hl":"en","gl":"us","google_domain":"google.com","tld":"com"},
+    "us-en": {"hl":"en","gl":"us","google_domain":"google.com","tld":"us"},
+    "uk-en": {"hl":"en","gl":"gb","google_domain":"google.co.uk","tld":"uk"},
+    "de-de": {"hl":"de","gl":"de","google_domain":"google.de","tld":"de"},
+    "fr-fr": {"hl":"fr","gl":"fr","google_domain":"google.fr","tld":"fr"},
+    "ru-ru": {"hl":"ru","gl":"ru","google_domain":"google.ru","tld":"ru"},
+    "ua-ua": {"hl":"uk","gl":"ua","google_domain":"google.com.ua","tld":"ua"},
+    "kz-ru": {"hl":"ru","gl":"kz","google_domain":"google.kz","tld":"kz"},
+    "by-ru": {"hl":"ru","gl":"by","google_domain":"google.by","tld":"by"},
+    "tr-tr": {"hl":"tr","gl":"tr","google_domain":"google.com.tr","tld":"tr"},
+    "ae-en": {"hl":"en","gl":"ae","google_domain":"google.ae","tld":"ae"},
+    "in-en": {"hl":"en","gl":"in","google_domain":"google.co.in","tld":"in"},
+    "sg-en": {"hl":"en","gl":"sg","google_domain":"google.com.sg","tld":"sg"},
+    "es-es": {"hl":"es","gl":"es","google_domain":"google.es","tld":"es"},
+    "it-it": {"hl":"it","gl":"it","google_domain":"google.it","tld":"it"},
+    "nl-nl": {"hl":"nl","gl":"nl","google_domain":"google.nl","tld":"nl"},
+    "se-sv": {"hl":"sv","gl":"se","google_domain":"google.se","tld":"se"},
+    "no-no": {"hl":"no","gl":"no","google_domain":"google.no","tld":"no"},
+    "fi-fi": {"hl":"fi","gl":"fi","google_domain":"google.fi","tld":"fi"},
+    "cz-cs": {"hl":"cs","gl":"cz","google_domain":"google.cz","tld":"cz"},
+    "sk-sk": {"hl":"sk","gl":"sk","google_domain":"google.sk","tld":"sk"},
+    "ro-ro": {"hl":"ro","gl":"ro","google_domain":"google.ro","tld":"ro"},
+    "hu-hu": {"hl":"hu","gl":"hu","google_domain":"google.hu","tld":"hu"},
+    "ch-de": {"hl":"de","gl":"ch","google_domain":"google.ch","tld":"ch"},
+    "br-pt": {"hl":"pt","gl":"br","google_domain":"google.com.br","tld":"br"},
+    "mx-es": {"hl":"es","gl":"mx","google_domain":"google.com.mx","tld":"mx"},
+    "au-en": {"hl":"en","gl":"au","google_domain":"google.com.au","tld":"au"},
+    "nz-en": {"hl":"en","gl":"nz","google_domain":"google.co.nz","tld":"nz"},
 }
 
 REGION_LANG_ALLOW = {
-    "ua-ua": ("uk", "ru", "en"),
-    "by-ru": ("ru", "en"),
-    "kz-ru": ("ru", "en"),
-    "ru-ru": ("ru", "en"),
-    "wt-wt": ("en", "ru", "uk"),
+    "ua-ua": ("uk","ru","en"),
+    "by-ru": ("ru","en"),
+    "kz-ru": ("ru","en"),
+    "ru-ru": ("ru","en"),
+    "wt-wt": ("en","ru","uk"),
 }
 
 REGION_HINTS = {
-    "ua-ua": {
-        "tokens": ["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA"],
-        "org": ["ТОВ","ФОП","LLC","ПП","ПрАТ","АТ"],
-        "cities": ["Kyiv","Київ","Lviv","Львів","Odesa","Одеса","Kharkiv","Харків","Dnipro","Дніпро"]
-    },
-    "by-ru": {
-        "tokens": ["Беларусь","Belarus","Минск","Minsk","BY","Гродно","Брест","Гомель","Витебск","Могилев"],
-        "org": ["ООО","ЧУП","ЗАО","ОАО"],
-        "cities": ["Минск","Minsk","Гродно","Брест","Гомель","Витебск","Могилев"]
-    },
-    "kz-ru": {
-        "tokens": ["Казахстан","Kazakhstan","Алматы","Almaty","Алма-Ата","Астана","Astana","Нур-Султан","Шымкент","Karaganda","Караганда","KZ"],
-        "org": ["ТОО","LLP","ИП","ЖШС"],
-        "cities": ["Алматы","Almaty","Астана","Astana","Шымкент","Караганда"]
-    },
-    "ru-ru": {
-        "tokens": ["Россия","Russian Federation","Москва","Санкт-Петербург","Новосибирск","Екатеринбург","RF","RU"],
-        "org": ["ООО","АО","ИП","ПАО","ЗАО","ОАО"],
-        "cities": ["Москва","Санкт-Петербург","Новосибирск","Екатеринбург","Казань","Нижний Новгород"]
-    },
+    "ua-ua": {"tokens":["Україна","Ukraine","Київ","Kyiv","Львів","Lviv","Одеса","Odesa","Дніпро","Dnipro","Харків","Kharkiv","UA"],
+              "org":["ТОВ","ФОП","LLC","ПП","ПрАТ","АТ"],
+              "cities":["Kyiv","Київ","Lviv","Львів","Odesa","Одеса","Kharkiv","Харків","Dnipro","Дніпро"]},
+    "by-ru": {"tokens":["Беларусь","Belarus","Минск","Minsk","BY","Гродно","Брест","Гомель","Витебск","Могилев"],
+              "org":["ООО","ЧУП","ЗАО","ОАО"],
+              "cities":["Минск","Minsk","Гродно","Брест","Гомель","Витебск","Могилев"]},
+    "kz-ru": {"tokens":["Казахстан","Kazakhstan","Алматы","Almaty","Астана","Astana","Шымкент","Karaganda","Караганда","KZ"],
+              "org":["ТОО","LLP","ИП","ЖШС"],
+              "cities":["Алматы","Almaty","Астана","Astana","Шымкент","Караганда"]},
+    "ru-ru": {"tokens":["Россия","Russian Federation","Москва","Санкт-Петербург","Новосибирск","Екатеринбург","RF","RU"],
+              "org":["ООО","АО","ИП","ПАО","ЗАО","ОАО"],
+              "cities":["Москва","Санкт-Петербург","Новосибирск","Екатеринбург","Казань","Нижний Новгород"]},
 }
 
 # ======================= Intent / Filters =======================
@@ -319,7 +286,6 @@ BAD_DOMAINS_HARD = {
     "addons.mozilla.org","microsoft.com","support.microsoft.com","edge.microsoft.com",
     "minecraft.net","curseforge.com","planetminecraft.com","softonic.com","apkpure.com","apkcombo.com","uptodown.com",
 }
-
 SOFT_BAD_DOMAINS = {
     "wikipedia.org","en.wikipedia.org","ru.wikipedia.org","uk.wikipedia.org",
     "work.ua","rabota.ua","hh.ru","jobs.ua","djinni.co","indeed.com","glassdoor.com",
@@ -333,7 +299,6 @@ EVENT_HINTS = ("conference","expo","summit","event","exhibition","agenda","speak
 DIRECTORY_HINTS = ("directory","catalog","list","listing","rank","rating","top-","compare","comparison")
 CASINO_TLDS = (".casino",".bet",".betting",".poker",".slots",".bingo")
 
-# Анти-сигналы: операторские и сети для вебмастеров
 OPERATOR_PROGRAM_HINTS = (
     "join our affiliate program","affiliates program","affiliate portal","commission",
     "revshare","cpa","commission tiers","promotional materials","tracking platform",
@@ -347,8 +312,6 @@ PSP_HINTS = (
     "payment solutions","payments provider","psp","acquirer","merchant of record","accept payments",
     "crypto processing","apm","payment gateway","card processing"
 )
-
-# Сигналы услуг/управления для операторов (агентства/OPM/платформы)
 COMPANY_SERVICE_HINTS = (
     "our services","services","solutions","platform","for operators","for brands","for advertisers",
     "clients","case study","case studies","features","integrations","pricing",
@@ -364,25 +327,25 @@ def looks_like_job(url: str, text: str) -> bool:
     if d in SOFT_BAD_DOMAINS:
         if "job" in u or "career" in u or "vacanc" in u or "ваканси" in u or "работа" in u:
             return True
-    t = text.lower()
+    t = (text or "").lower()
     return any(x in t for x in ("vacanc","ваканси","работа","hiring","we are hiring","careers"))
 
 def looks_like_event(url: str, text: str) -> bool:
     u = url.lower()
     if any(e in u for e in EVENT_HINTS): return True
-    t = text.lower()
+    t = (text or "").lower()
     return any(e in t for e in EVENT_HINTS)
 
 def looks_like_directory(url: str, text: str) -> bool:
     u = url.lower()
     if any(e in u for e in DIRECTORY_HINTS): return True
-    t = text.lower()
+    t = (text or "").lower()
     return any(e in t for e in DIRECTORY_HINTS)
 
 def looks_like_blog(url: str, text: str) -> bool:
     u = url.lower()
     if any(e in u for e in BLOG_HINTS_URL): return True
-    t = text.lower()
+    t = (text or "").lower()
     return any(e in t for e in ("what is","що таке","что такое","guide","обзор","overview","гайд","курс","лекция","лекція","blog","news"))
 
 def is_hard_bad_domain(dom: str) -> bool:
@@ -398,7 +361,7 @@ def detect_intent(q: str) -> Dict[str, bool]:
     casino = any(k in t for k in CASINO_TOKENS)
     return {"affiliate": affiliate or casino, "learn": learn, "casino": casino, "business": not learn}
 
-# ======================= Request counter (по движкам) =======================
+# ======================= Request counter =======================
 def _load_request_count():
     try:
         with open(REQUEST_COUNT_FILE, "r", encoding="utf-8") as f:
@@ -450,8 +413,6 @@ def build_core_queries(user_prompt: str) -> List[str]:
         "casino affiliate program management",
         "igaming affiliate management company",
         "outsourced affiliate program management igaming",
-        "casino affiliate network for operators",
-        "igaming affiliate platform for operators",
         "casino affiliate services for operators",
         "игейминг аффилиат агентство",
         "агентство по аффилиат маркетингу казино",
@@ -459,6 +420,8 @@ def build_core_queries(user_prompt: str) -> List[str]:
         "OPM igaming",
         "affiliate management for casino operators",
         "igaming acquisition agency for operators",
+        "casino affiliate consulting for operators",
+        "affiliate program setup igaming",
     ]
     seen = set(); out = []
     for q in core:
@@ -615,7 +578,6 @@ def _request_headers():
     return {"User-Agent": DEFAULT_UA, "Accept-Language": random.choice(ACCEPT_LANG_POOL)}
 
 def _http_get(url: str) -> Optional[requests.Response]:
-    # 2 попытки с коротким бэкоффом
     for attempt in (1,2):
         try:
             resp = requests.get(url, headers=_request_headers(), timeout=REQUEST_TIMEOUT)
@@ -639,7 +601,7 @@ def extract_text_for_classification(html: bytes) -> Tuple[str, str, List[Tuple[s
         soup = BeautifulSoup(html.decode(enc, errors="ignore"), "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
-    for bad in soup(["script", "style", "noscript", "svg", "picture", "source"]):
+    for bad in soup(["script","style","noscript","svg","picture","source"]):
         bad.decompose()
 
     title = (soup.title.string if soup.title and soup.title.string else "").strip()
@@ -692,12 +654,10 @@ def fetch_one(url: str, region: str) -> Optional[Dict[str,Any]]:
         if not text: return None
 
         t_low = text.lower()
-        # Вырезаем сети "для вебмастеров", блоги, каталоги, мероприятия, вакансии, PSP
         if any(h in t_low for h in NETWORK_FOR_PUBLISHERS_HINTS): return None
         if any(h in t_low for h in ("blog","news","glossary")): return None
         if any(h in t_low for h in PSP_HINTS): return None
 
-        # Микрокраул — только если слаб регион или мало company-сигналов
         need_more_region = region_affinity_quick(url, t_low, region) < 0.6
         need_company = not is_company_or_platform(url, t_low)
         extras_text = ""
@@ -807,10 +767,10 @@ def base_relevance(text: str) -> float:
 
 def score_item(url: str, text: str, region: str) -> float:
     d = domain_of(url)
-    score = 0.85*base_relevance(text) + 1.1*region_affinity(url, text, region) + quality_score(url, text) \
+    score = 0.85*base_relevance(text) + 1.15*region_affinity(url, text, region) + quality_score(url, text) \
             + domain_feedback_adjustment(d) + agency_boost(text)
     if any(url.lower().endswith(ct) for ct in CASINO_TLDS): score -= 0.2
-    return max(0.0, min(2.2, score))
+    return max(0.0, min(2.4, score))
 
 # ======================= Persistence =======================
 def insert_query_record(text: str, intent: Dict[str,bool], region: str) -> str:
@@ -878,11 +838,11 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
     intent = detect_intent(user_prompt)
     base_queries = build_core_queries(user_prompt)
 
-    # Расширение базовых запросов городами региона (для повышения локали)
+    # добавляем городские вариации (усиление локали)
     cities = REGION_HINTS.get(region, {}).get("cities", [])
     city_queries = []
-    for q in base_queries[:6]:
-        for city in cities[:4]:  # не агрессивно
+    for q in base_queries[:8]:
+        for city in cities[:5]:
             city_queries.append(f"{q} {city}")
 
     queries = base_queries + city_queries
@@ -892,17 +852,14 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
 
 def collect_urls(web_queries: List[str], region: str, engine: str, per_query_k: int) -> List[str]:
     all_urls: List[str] = []
-
-    # 1) Всегда сначала DDG (основной)
     for q in web_queries:
         all_urls.extend(duckduckgo_search(q, max_results=per_query_k, region=region))
 
-    # 2) SerpAPI — только если мало URL и нет cooldown
     need_fallback = (engine in ("serpapi","both")) and SERPAPI_API_KEY and (len(all_urls) < MIN_RESULTS * 3)
     if need_fallback:
         for q in web_queries:
             all_urls.extend(serpapi_search(q, max_results=per_query_k, region=region))
-            if len(all_urls) >= MAX_RESULTS * 12:
+            if len(all_urls) >= MAX_RESULTS * 14:
                 break
 
     deduped, seen = [], set()
@@ -920,11 +877,10 @@ def _prefilter_url(url: str, name: str, text: str) -> Optional[str]:
     if looks_like_directory(url, text): return "directory"
     if looks_like_blog(url, text): return "blog"
     if is_network_for_publishers(text): return "network_for_publishers"
-    if is_operator_program(url, text): return "operator_program"
-    if any(k in text.lower() for k in PSP_HINTS): return "psp"
+    if any(k in (text or "").lower() for k in PSP_HINTS): return "psp"
     return None
 
-def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
+def scrape_parallel(urls: List[str], region: str, accept_operator: bool = True) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []
 
     per_host_counter: Dict[str,int] = {}
@@ -940,7 +896,6 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
     tld = "." + reg["tld"] if reg.get("tld") else ""
 
     start_ts = time.time()
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fut2url = {ex.submit(fetch_one, u, region): u for u in filtered_urls}
         for fut in as_completed(fut2url):
@@ -954,7 +909,14 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
             bad_reason = _prefilter_url(url, name, text)
             if bad_reason: continue
 
-            if classify(url, text) != "company_or_platform": continue
+            label = classify(url, text)
+            if label == "company_or_platform":
+                pass
+            elif label == "operator_program" and accept_operator:
+                pass
+            else:
+                continue
+
             if not language_ok(text, region): continue
 
             score = score_item(url, text, region)
@@ -978,15 +940,14 @@ def scrape_parallel(urls: List[str], region: str) -> List[Dict[str,Any]]:
         items.sort(key=lambda x: x["score"], reverse=True)
         compact.append(items[0])
 
-    # Региональный приоритет — динамический
+    # Региональный приоритет
     if tld:
         local = [r for r in compact if r["website"].lower().endswith(tld) or region_affinity(r["website"], r["description"], region) >= 0.6]
         global_ = [r for r in compact if r not in local]
         local.sort(key=lambda x: x["score"], reverse=True)
         global_.sort(key=lambda x: x["score"], reverse=True)
-        local_count = len(local)
-        dynamic_local_share = 0.7 if local_count >= MIN_RESULTS else 0.5
-        want_local = max(int(dynamic_local_share * MAX_RESULTS), MIN_RESULTS // 2)
+        # обязательная доля локали (если доступна)
+        want_local = max(int(0.6 * MAX_RESULTS), MIN_RESULTS // 2)
         results_final = (local[:want_local]) + (local[want_local:] + global_)
     else:
         results_final = sorted(compact, key=lambda x: x["score"], reverse=True)
@@ -997,26 +958,28 @@ def escalate_if_needed(results: List[Dict[str,Any]], urls: List[str], region: st
     if len(results) >= MIN_RESULTS:
         return results
 
-    # 1) Мягкая эскалация: новые запросы без site:.tld, но с country/city tokens
+    # Эскалация-1: ещё урлы (без жёсткого site:.tld), + городские варианты
     geo_queries_soft = build_core_queries(user_prompt)
     cities = REGION_HINTS.get(region, {}).get("cities", [])
-    for city in cities[:5]:
+    for city in cities[:6]:
         geo_queries_soft.append(f"{user_prompt} {city}")
     geo_queries_soft = apply_geo_bias(geo_queries_soft, region)
-    geo_queries_soft = [q for i,q in enumerate(geo_queries_soft) if i not in (1,2)]  # без строгого site:.
+    geo_queries_soft = [q for i,q in enumerate(geo_queries_soft) if i not in (1,2)]
 
     more_urls = collect_urls([with_intent_filters(q, detect_intent(user_prompt)) for q in geo_queries_soft], region, engine, per_query_k)
     merged = list(dict.fromkeys(urls + more_urls))
-    more = scrape_parallel(merged[len(urls):len(urls)+800], region)
+
+    # Второй проход — принимаем operator_program тоже (accept_operator=True уже)
+    more = scrape_parallel(merged[:1200], region, accept_operator=True)
 
     known = set(r["website"] for r in results)
     for r in more:
         if r["website"] not in known:
             results.append(r); known.add(r["website"])
 
-    # 2) Если всё ещё меньше MIN_RESULTS — дополнительный проход по хвосту
+    # Эскалация-2: если всё ещё не хватило — расширяем хвост до 2000 урлов
     if len(results) < MIN_RESULTS:
-        tail_more = scrape_parallel(merged[len(urls)+800:len(urls)+1400], region)
+        tail_more = scrape_parallel(merged[1200:2000], region, accept_operator=True)
         for r in tail_more:
             if r["website"] not in known:
                 results.append(r); known.add(r["website"])
@@ -1039,7 +1002,7 @@ def search():
         data = request.json or {}
         user_query = data.get("query", "").strip()
         region = data.get("region", "wt-wt")
-        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE","ddg")).lower()  # ddg по умолчанию
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE","ddg")).lower()
         per_query_k = int(data.get("per_query", 25))
 
         if not user_query:
@@ -1059,7 +1022,7 @@ def search():
         logger.info(f"Pre-filtered URLs (unique & not blocked): {len(urls)}")
 
         t0 = time.time()
-        web_results = scrape_parallel(urls[:600], region)
+        web_results = scrape_parallel(urls[:800], region, accept_operator=True)
 
         if len(web_results) < MIN_RESULTS:
             web_results = escalate_if_needed(web_results, urls, region, engine, per_query_k, user_query)
