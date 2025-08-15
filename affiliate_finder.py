@@ -1261,6 +1261,33 @@ def prefer_country_results(rows: List[dict], region: str) -> List[dict]:
     b = [r for r in rows if not domain_of(r.get("website","")).endswith(tld)]
     return a + b
 
+def load_blocked_domains(min_neg_weight: float = 2.0) -> set:
+    """
+    Возвращает множество доменов, по которым накоплен отрицательный фидбэк (action='bad')
+    с суммарным весом >= порога.
+
+    По умолчанию порог = 2.0: это ровно один клик по флажку (у тебя weight=2.0 для 'bad').
+    При желании подними порог, например, до 4.0 (две жалобы), чтобы бан был «строже».
+    """
+    blocked = set()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT domain,
+                SUM(CASE WHEN action='bad' THEN weight ELSE 0 END) -
+                SUM(CASE WHEN action='good' THEN weight ELSE 0 END) AS net
+                FROM interactions
+                GROUP BY domain
+                HAVING net >= ?
+        """, (min_neg_weight,))
+            for domain, neg in c.fetchall():
+                if domain:
+                    blocked.add(domain)
+    except Exception as e:
+        logger.error(f"load_blocked_domains error: {e}")
+    return blocked
+
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     if request.method == "OPTIONS":
@@ -1313,7 +1340,7 @@ def search():
         # Запишем сам запрос в историю — вернётся query_id
         query_id = insert_query_record(user_query, intent, region)
 
-        # Учитываем «обучение»: бусты по доменам
+        # Буcты по доменам из истории
         boosts = history_boosts(intent, region)
 
         # Если кириллица и регион дефолтный — для DDG используем ru-ru
@@ -1338,7 +1365,7 @@ def search():
         # Скрейп
         web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
 
-        # Жёсткая финальная чистка
+        # Жёсткая финальная чистка контента
         filtered = []
         for r in web_results:
             txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
@@ -1353,20 +1380,27 @@ def search():
                 continue
             filtered.append(r)
 
-        # ========= NEW: Добавляем 4–6 вариантов с affcatalog (для affiliate+casino) =========
+        # ========= Добавляем 4–6 вариантов с Affcatalog (для affiliate+casino) =========
         already_urls = set(r.get("website","") for r in filtered)
-        aff_rows = scrape_affcatalog_suggestions(intent=intent, prompt_phrases=prompt_phrases, region=region, query_id=query_id, already_urls=already_urls)
-
-        # Добавим, но не засоряем дублями
+        aff_rows = scrape_affcatalog_suggestions(
+            intent=intent, prompt_phrases=prompt_phrases, region=region, query_id=query_id, already_urls=already_urls
+        )
         if aff_rows:
-            # лёгкая приоритизация: вставим их ближе к началу, но не на самый топ — повысим им score чуть-чуть
             for ar in aff_rows:
                 ar["score"] = min(ar.get("score", 0.55) + 0.05, 0.98)
             filtered.extend(aff_rows)
 
+        # ========= Удаляем домены с накопленным bad-фидбэком (серверный бан) =========
+        blocked = load_blocked_domains(min_neg_weight=2.0)  # при желании подними порог до 4.0
+        if blocked:
+            before = len(filtered)
+            filtered = [r for r in filtered if domain_of(r.get("website","")) not in blocked]
+            logger.info(f"Blocked domains active: {len(blocked)}; removed {before - len(filtered)} rows")
+
         # Гео-приоритизация и сортировка
         all_results = prefer_country_results(filtered, region)
-        # финальный дедуп по урлу
+
+        # Финальный дедуп по URL
         seen = set()
         deduped = []
         for r in all_results:
@@ -1377,16 +1411,19 @@ def search():
             deduped.append(r)
         all_results = deduped
 
+        # Сортировка по score
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
-        # Экспорты
+        # Экспорты (опциональные)
         save_to_csv()
         save_to_txt()
 
+        # Возвращаем query_id для фронта
         return jsonify({
             "results": all_results,
             "region": region,
-            "engine": engine
+            "engine": engine,
+            "query_id": query_id,
         })
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -1396,22 +1433,32 @@ def search():
 @app.route("/feedback", methods=["POST"])
 def feedback():
     """
-    body: { "query_id": "...", "url": "...", "action": "click|good|bad" }
+    body: { "query_id": "...", "url": "...", "action": "click|good|bad|flag" }
     """
     try:
         data = request.json or {}
         query_id = (data.get("query_id") or "").strip()
         url = (data.get("url") or "").strip()
         action = (data.get("action") or "").strip().lower()
+
+        if action == "flag":  # маппим фронтовый флажок на 'bad'
+            action = "bad"
+
         if not (query_id and url and action in {"click","good","bad"}):
-            return jsonify({"error":"query_id, url, action(click|good|bad) required"}), 400
-        weight = 1.0 if action=="click" else (2.0 if action=="good" else 2.0)
+            return jsonify({"error": "query_id, url, action(click|good|bad|flag) required"}), 400
+
+        # веса: click = +1.0 (слегка положительный), good = +2.0 (явно положительный), bad = +2.0 (явно отрицательный)
+        weight = 1.0 if action == "click" else 2.0
+
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("""INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                      (str(uuid.uuid4()), query_id, url, domain_of(url), action, weight, datetime.utcnow().isoformat()))
+            c.execute(
+                """INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), query_id, url, domain_of(url), action, weight, datetime.utcnow().isoformat())
+            )
             conn.commit()
+
         return jsonify({"ok": True})
     except Exception as e:
         logger.error(f"/feedback error: {e}")
