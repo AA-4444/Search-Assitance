@@ -102,6 +102,11 @@ DAILY_REQUEST_LIMIT = int(os.getenv("DAILY_REQUEST_LIMIT", "1000"))
 REQUEST_PAUSE_MIN = float(os.getenv("REQUEST_PAUSE_MIN", "0.8"))
 REQUEST_PAUSE_MAX = float(os.getenv("REQUEST_PAUSE_MAX", "1.6"))
 
+# ========= affcatalog config =========
+AFFCATALOG_BASE = os.getenv("AFFCATALOG_BASE", "https://affcatalog.com/ru/")
+AFFCATALOG_MIN = int(os.getenv("AFFCATALOG_MIN", "4"))
+AFFCATALOG_MAX = int(os.getenv("AFFCATALOG_MAX", "6"))
+
 # ========= Search engines & helpers =========
 from ddgs import DDGS
 
@@ -740,7 +745,7 @@ def generate_search_queries(user_prompt: str, region="wt-wt") -> Tuple[List[str]
 NEGATIVE_SITES_FOR_BUSINESS = [
     "site:wikipedia.org","site:en.wikipedia.org","site:ru.wikipedia.org",
     "site:hubspot.com","site:coursera.org","site:ibm.com","site:sproutsocial.com",
-    "site:digitalmarketinginstitute.com","site:marketermilk.com","site:harvard.edu","site:professional.dce.harvard.edu"
+    "digitalmarketinginstitute.com","marketermilk.com","harvard.edu","professional.dce.harvard.edu"
 ]
 NEGATIVE_INURL_FOR_BLOGS = [
     "inurl:blog","inurl:news","inurl:guide","inurl:guides","inurl:insights","inurl:academy",
@@ -944,6 +949,170 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
     logger.info(f"Total web results scraped: {len(results)}")
     return results
 
+# ========= Affcatalog scraper (NEW) =========
+AFF_RELEVANT_TOKENS_RU = [
+    "казино","ставк","бетт","игемблинг","игейминг","гемблинг","букмек","слоты","игры","игорн"
+]
+AFF_RELEVANT_TOKENS_EN = [
+    "casino","gambl","igaming","bet","sportsbook","slot","bookmak"
+]
+AFF_LINK_TOKENS = [
+    "/ru/", "/offer", "/offers", "/program", "/programs", "/affiliate", "/aff", "/network", "/networks"
+]
+
+def _aff_is_relevant_text(t: str) -> bool:
+    if not t:
+        return False
+    tl = t.lower()
+    return any(tok in tl for tok in AFF_RELEVANT_TOKENS_RU) or any(tok in tl for tok in AFF_RELEVANT_TOKENS_EN)
+
+def _aff_is_relevant_href(href: str) -> bool:
+    if not href:
+        return False
+    h = href.lower()
+    return ("affcatalog.com" in h) and any(tok in h for tok in AFF_LINK_TOKENS + AFF_RELEVANT_TOKENS_RU + AFF_RELEVANT_TOKENS_EN)
+
+def _safe_get(url: str, timeout: float = 20.0, allow_proxy_retry: bool = True):
+    """Внутренний геттер с мягкими ретраями через прокси при 403/429/timeout."""
+    attempts = 0
+    proxies_used = []
+    while attempts <= MAX_PROXY_ATTEMPTS:
+        proxy = None
+        if attempts > 0 and allow_proxy_retry:
+            proxy = get_proxy()
+            if proxy in proxies_used:
+                proxy = None
+            if proxy:
+                proxies_used.append(proxy)
+        try:
+            headers = {"User-Agent": os.getenv("SCRAPER_UA",
+                      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")}
+            resp = requests.get(url, headers=headers, timeout=timeout, proxies=proxy)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            se = str(e).lower()
+            if any(x in se for x in ["403","429","timeout","connection","ssl","remote disconnected"]):
+                attempts += 1
+                if attempts > MAX_PROXY_ATTEMPTS:
+                    logger.warning(f"Affcatalog: max proxy attempts for {url}")
+                    break
+                time.sleep(random.uniform(REQUEST_PAUSE_MIN, REQUEST_PAUSE_MAX))
+                continue
+            logger.error(f"Affcatalog: fatal error for {url}: {e}")
+            break
+    return None
+
+def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[str], region: str, query_id: str, already_urls: set) -> List[dict]:
+    """
+    Пробегаемся по affcatalog.com/ru, находим карточки/страницы по казино/игеймингу,
+    собираем 4–6 вариантов и возвращаем в формате rows как в основном скрейпе.
+    """
+    if not (intent.get("affiliate") and intent.get("casino")):
+        logger.info("Affcatalog: intent not affiliate+casino, skip")
+        return []
+
+    try:
+        need_n = max(AFFCATALOG_MIN, 1)
+        need_n = min(need_n + random.randint(0, max(AFFCATALOG_MAX - AFFCATALOG_MIN, 0)), AFFCATALOG_MAX)
+    except Exception:
+        need_n = 5  # дефолт 4–6 → возьмём 5
+
+    base_url = AFFCATALOG_BASE.rstrip("/") + "/"
+    resp = _safe_get(base_url)
+    if not resp:
+        logger.warning("Affcatalog: base page not available")
+        return []
+
+    soup = BeautifulSoup(resp.content, "html.parser")
+
+    # Собираем все потенциально релевантные ссылки внутри affcatalog
+    candidates: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = a.get_text(" ").strip()
+        if not href:
+            continue
+        # Нормализуем относительные ссылки
+        if href.startswith("/"):
+            href = base_url.rstrip("/") + href
+        if "affcatalog.com" not in href:
+            continue
+        # Фильтрация на предмет релевантности
+        if _aff_is_relevant_href(href) or _aff_is_relevant_text(text):
+            candidates.append(href)
+
+    # Дедупим и слегка перемешаем (чтобы не было всегда одних и тех же)
+    candidates = list(dict.fromkeys(candidates))
+    random.shuffle(candidates)
+
+    rows: List[dict] = []
+    seen_urls = set()
+
+    for href in candidates:
+        if len(rows) >= need_n:
+            break
+        if href in already_urls or href in seen_urls:
+            continue
+        sub = _safe_get(href)
+        if not sub:
+            continue
+        s2 = BeautifulSoup(sub.content, "html.parser")
+
+        # Пытаемся прочитать заголовок/название карточки
+        name = "N/A"
+        title_el = s2.select_one("h1, .card-title, .title, .header-title, [class*='title']")
+        if title_el:
+            name = clean_description(getattr(title_el, "text", "") or title_el)
+        else:
+            # запасной вариант — <title>
+            ttag = s2.find("title")
+            if ttag and ttag.text:
+                name = clean_description(ttag.text)
+
+        # Описание — meta description → первый параграф → общий фоллбек
+        description = "N/A"
+        meta = s2.find("meta", attrs={"name": "description"})
+        if meta and meta.get("content"):
+            description = clean_description(meta["content"])
+        if description == "N/A" or len(description) < 10:
+            p = s2.select_one("p, .description, .excerpt, .card-text, [class*='desc']")
+            if p:
+                description = clean_description(p.get_text(" "))
+
+        # Жёсткая релевантность к казино/игеймингу
+        if not (_aff_is_relevant_text(name) or _aff_is_relevant_text(description) or _aff_is_relevant_href(href)):
+            continue
+
+        # Гео-инфо найти сложно — чаще всего это агрегатор, оставим "N/A"
+        country = "N/A"
+
+        # Выставим немного повышенный балл, чтобы карточки не потерялись в самом низу
+        base_score = 0.55
+        try:
+            base_score += 0.1 if any(p.lower() in (description or "").lower() for p in prompt_phrases[:3]) else 0.0
+        except Exception:
+            pass
+
+        row = {
+            "id": str(uuid.uuid4()),
+            "name": name if name and name != "N/A" else "Affcatalog — партнёрская программа",
+            "website": href,
+            "description": description if description and description != "N/A" else "Партнёрская программа/каталог из Affcatalog (iGaming / casino / betting).",
+            "country": country,
+            "source": "Affcatalog",
+            "score": min(max(base_score, 0.0), 0.95),
+        }
+        rows.append(row)
+        seen_urls.add(href)
+
+    # Сохраним в БД/историю
+    for r in rows:
+        save_result_records(r, intent, region, query_id)
+
+    logger.info(f"Affcatalog: added {len(rows)} suggestion(s)")
+    return rows
+
 # ========= Persistence =========
 def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str, query_id: str):
     """Пишем и в кратковременную таблицу results (для текущей выдачи), и в results_history (для обучения)."""
@@ -1120,8 +1289,30 @@ def search():
                 continue
             filtered.append(r)
 
+        # ========= NEW: Добавляем 4–6 вариантов с affcatalog (для affiliate+casino) =========
+        already_urls = set(r.get("website","") for r in filtered)
+        aff_rows = scrape_affcatalog_suggestions(intent=intent, prompt_phrases=prompt_phrases, region=region, query_id=query_id, already_urls=already_urls)
+
+        # Добавим, но не засоряем дублями
+        if aff_rows:
+            # лёгкая приоритизация: вставим их ближе к началу, но не на самый топ — повысим им score чуть-чуть
+            for ar in aff_rows:
+                ar["score"] = min(ar.get("score", 0.55) + 0.05, 0.98)
+            filtered.extend(aff_rows)
+
         # Гео-приоритизация и сортировка
         all_results = prefer_country_results(filtered, region)
+        # финальный дедуп по урлу
+        seen = set()
+        deduped = []
+        for r in all_results:
+            w = r.get("website","").strip()
+            if not w or w in seen:
+                continue
+            seen.add(w)
+            deduped.append(r)
+        all_results = deduped
+
         all_results.sort(key=lambda x: x["score"], reverse=True)
 
         # Экспорты
@@ -1170,7 +1361,7 @@ def api_search():
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
     if filetype not in ["csv", "txt"]:
-        return jsonify({"error": "Invalid file type, use 'csv' or 'txt'"}), 400
+        return jsonify({"error": "Invalid file type, use 'csv' or 'txt"}), 400
     filename = f"search_results.{filetype}"
     try:
         mimetype = "text/plain" if filetype == "txt" else "text/csv"
