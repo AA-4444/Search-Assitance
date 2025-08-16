@@ -12,9 +12,17 @@ from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
 from urllib.parse import urlparse, urljoin
 
+
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+import time
+
+def _to_ms(ts: str) -> int:
+    try:
+        return int(datetime.fromisoformat(ts).timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
 
 # ======================= Helpers: text cleaning =======================
 CODE_FENCE_RE = re.compile(r"^```(?:json|js|python|txt)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -261,6 +269,54 @@ def init_db():
 # ВАЖНО: под gunicorn блок __main__ не срабатывает — инициируем БД при импорте
 init_db()
 
+# --- DB migrations ----
+def _table_has_column(conn, table: str, column: str) -> bool:
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in c.fetchall())
+
+def migrate_add_chat_id_to_queries():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if not _table_has_column(conn, "queries", "chat_id"):
+                conn.execute("ALTER TABLE queries ADD COLUMN chat_id TEXT")
+                conn.commit()
+                logger.info("Migration: queries.chat_id added")
+    except Exception as e:
+        logger.error(f"Migration add chat_id failed: {e}")
+
+def migrate_extend_results_history():
+    """
+    Добавляем name/description/country в results_history, чтобы уметь отдавать полноценные карточки из истории.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if not _table_has_column(conn, "results_history", "name"):
+                conn.execute("ALTER TABLE results_history ADD COLUMN name TEXT")
+            if not _table_has_column(conn, "results_history", "description"):
+                conn.execute("ALTER TABLE results_history ADD COLUMN description TEXT")
+            if not _table_has_column(conn, "results_history", "country"):
+                conn.execute("ALTER TABLE results_history ADD COLUMN country TEXT")
+            conn.commit()
+            logger.info("Migration: results_history extended (name/description/country)")
+    except Exception as e:
+        logger.error(f"Migration extend results_history failed: {e}")
+
+def migrate_add_chat_id_to_interactions():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if not _table_has_column(conn, "interactions", "chat_id"):
+                conn.execute("ALTER TABLE interactions ADD COLUMN chat_id TEXT")
+                conn.commit()
+                logger.info("Migration: interactions.chat_id added")
+    except Exception as e:
+        logger.error(f"Migration add chat_id (interactions) failed: {e}")
+
+# запуск миграций
+migrate_add_chat_id_to_queries()
+migrate_extend_results_history()
+migrate_add_chat_id_to_interactions()
+
 # ========= Utility: counters & proxies =========
 def load_request_count():
     try:
@@ -406,13 +462,13 @@ def maybe_add_ru_site_dupes(queries: List[str]) -> List[str]:
     return out
 
 # ========= History helpers (learning) =========
-def insert_query_record(text: str, intent: Dict[str,bool], region: str) -> str:
+def insert_query_record(text: str, intent: Dict[str,bool], region: str, chat_id: str | None) -> str:
     qid = str(uuid.uuid4())
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO queries (id, text, intent_json, region, created_at) VALUES (?, ?, ?, ?, ?)",
-                      (qid, text, json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat()))
+            c.execute("INSERT INTO queries (id, text, intent_json, region, created_at, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+                      (qid, text, json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat(), chat_id))
             conn.commit()
     except Exception as e:
         logger.error(f"Failed to insert query: {e}")
@@ -1179,11 +1235,11 @@ def scrape_affcatalog_suggestions(intent: Dict[str,bool], prompt_phrases: List[s
 
 # ========= Persistence =========
 def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str, query_id: str):
-    """Пишем и в кратковременную таблицу results (для текущей выдачи), и в results_history (для обучения)."""
+    """Сохраняем карточку и в текущую выдачу, и в историю (с полями name/description/country)."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            # В текущую выдачу (как раньше)
+            # текущая выдача как было
             c.execute(
                 """INSERT OR IGNORE INTO results
                    (id, name, website, description, specialization, country, source, status, suitability, score)
@@ -1194,14 +1250,16 @@ def save_result_records(row: Dict[str,Any], intent: Dict[str,bool], region: str,
                     "Active", "Подходит", row.get("score",0.0),
                 ),
             )
-            # В историю
+
+            # история (расширенная)
             c.execute(
                 """INSERT OR IGNORE INTO results_history
-                   (id, query_id, url, domain, source, score, intent_json, region, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, query_id, url, domain, source, score, intent_json, region, created_at, name, description, country)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     str(uuid.uuid4()), query_id, row["website"], domain_of(row["website"]), row.get("source","Web"),
-                    row.get("score",0.0), json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat()
+                    row.get("score",0.0), json.dumps(intent, ensure_ascii=False), region, datetime.utcnow().isoformat(),
+                    row.get("name","N/A"), row.get("description","N/A"), row.get("country","N/A")
                 )
             )
             conn.commit()
@@ -1307,6 +1365,7 @@ def search():
         user_query = data.get("query", "")
         region = data.get("region", "wt-wt")
         engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()  # ddg | serpapi | both
+        chat_id = (data.get("chat_id") or "").strip() or None
         max_results = int(data.get("max_results", 15))
 
         if not user_query:
@@ -1338,7 +1397,7 @@ def search():
         web_queries, prompt_phrases, region, intent = generate_search_queries(user_query, region)
 
         # Запишем сам запрос в историю — вернётся query_id
-        query_id = insert_query_record(user_query, intent, region)
+        query_id = insert_query_record(user_query, intent, region, chat_id)
 
         # Буcты по доменам из истории
         boosts = history_boosts(intent, region)
@@ -1424,6 +1483,7 @@ def search():
             "region": region,
             "engine": engine,
             "query_id": query_id,
+            "chat_id": chat_id,
         })
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -1435,7 +1495,6 @@ def search():
 def feedback():
     """body: { "query_id": "...", "url": "...", "action": "click|good|bad|flag" }"""
     if request.method == "OPTIONS":
-        # дать браузеру CORS preflight
         resp = app.make_default_options_response()
         origin = request.headers.get("Origin")
         if origin in ALLOWED_ORIGINS:
@@ -1452,6 +1511,7 @@ def feedback():
         query_id = (data.get("query_id") or "").strip()
         url = (data.get("url") or "").strip()
         action = (data.get("action") or "").strip().lower()
+        chat_id = (data.get("chat_id") or "").strip() or None  # опционально
 
         if action == "flag":
             action = "bad"
@@ -1464,9 +1524,9 @@ def feedback():
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute(
-                """INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), query_id, url, domain_of(url), action, weight, datetime.utcnow().isoformat())
+                """INSERT INTO interactions (id, query_id, url, domain, action, weight, created_at, chat_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), query_id, url, domain_of(url), action, weight, datetime.utcnow().isoformat(), chat_id)
             )
             conn.commit()
 
@@ -1484,6 +1544,89 @@ def api_feedback():
 @app.route("/api/search", methods=["POST", "OPTIONS"])
 def api_search():
     return search()
+    
+@app.route("/chats", methods=["GET"])
+def list_chats():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT chat_id,
+                       MAX(created_at) as last_ts,
+                       MIN(text) as sample_title,
+                       COUNT(*) as items
+                FROM queries
+                WHERE chat_id IS NOT NULL AND chat_id <> ''
+                GROUP BY chat_id
+                ORDER BY last_ts DESC
+            """)
+            rows = c.fetchall()
+        chats = []
+        for chat_id, last_ts, sample_title, items in rows:
+            title = (sample_title or "Чат").strip()
+            title = (title[:48] + "…") if len(title) > 48 else title
+            chats.append({
+                "id": chat_id,
+                "title": title or "Чат",
+                "updated_at": last_ts,
+                "items": items,
+            })
+        return jsonify({"chats": chats})
+    except Exception as e:
+        logger.error(f"/chats error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/chats/<chat_id>", methods=["GET"])
+def get_chat(chat_id):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, text, intent_json, region, created_at
+                FROM queries
+                WHERE chat_id = ?
+                ORDER BY created_at ASC
+            """, (chat_id,))
+            qrows = c.fetchall()
+
+            items = []
+            for qid, text, intent_json, region, created_at in qrows:
+                c.execute("""
+                    SELECT name, url, description, country, source, score
+                    FROM results_history
+                    WHERE query_id = ?
+                    ORDER BY score DESC
+                    LIMIT 100
+                """, (qid,))
+                rrows = c.fetchall()
+                results = [{
+                    "id": str(uuid.uuid4()),
+                    "name": name or "N/A",
+                    "website": url,
+                    "description": description or "N/A",
+                    "country": country or "N/A",
+                    "source": source or "Web",
+                    "score": score or 0.0,
+                } for (name, url, description, country, source, score) in rrows]
+
+                items.append({
+                    "query": text,
+                    "region": region,
+                    "useTelegram": False,
+                    "queryId": qid,
+                    "results": results,
+                    "createdAt": _to_ms(created_at),
+                })
+
+        return jsonify({
+            "id": chat_id,
+            "title": (items[0]["query"][:48] + "…") if items else "Чат",
+            "items": items
+        })
+    except Exception as e:
+        logger.error(f"/chats/<chat_id> error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/download/<filetype>", methods=["GET"])
 def download_file(filetype):
