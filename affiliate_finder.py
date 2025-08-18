@@ -11,6 +11,8 @@ import requests
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any
 from urllib.parse import urlparse, urljoin
+from threading import Thread
+from datetime import datetime, timedelta
 
 
 from bs4 import BeautifulSoup
@@ -260,6 +262,15 @@ def init_db():
                     created_at TEXT
                 )"""
             )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS search_jobs (
+                    query_id TEXT PRIMARY KEY,
+                    status TEXT,              -- pending | running | done | error
+                    error TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )"""
+            )
 
             conn.commit()
         logger.info("Database initialized")
@@ -474,6 +485,38 @@ def insert_query_record(text: str, intent: Dict[str,bool], region: str, chat_id:
         logger.error(f"Failed to insert query: {e}")
     return qid
 
+def set_job_status(query_id: str, status: str, error: str | None = None):
+    try:
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO search_jobs (query_id, status, error, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(query_id) DO UPDATE SET
+                     status=excluded.status,
+                     error=excluded.error,
+                     updated_at=excluded.updated_at
+                """,
+                (query_id, status, error, now, now),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"set_job_status error: {e}")
+
+def get_job_status(query_id: str) -> dict:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""SELECT status, error, created_at, updated_at FROM search_jobs WHERE query_id=?""", (query_id,))
+            row = c.fetchone()
+            if not row:
+                return {"status": "unknown", "error": None, "created_at": None, "updated_at": None}
+            status, error, created_at, updated_at = row
+            return {"status": status, "error": error, "created_at": created_at, "updated_at": updated_at}
+    except Exception as e:
+        logger.error(f"get_job_status error: {e}")
+        return {"status": "error", "error": str(e), "created_at": None, "updated_at": None}
 def cache_get(key: str, max_age_hours: int = 12) -> Any:
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -1006,6 +1049,113 @@ def search_and_scrape_websites(urls: List[str], prompt_phrases: List[str], regio
     logger.info(f"Total web results scraped: {len(results)}")
     return results
 
+def _perform_search_and_store(user_query: str, region: str, engine: str, chat_id: str | None, max_results: int, query_id: str) -> list[dict]:
+    # Генерация подзапросов
+    web_queries, prompt_phrases, region, intent = generate_search_queries(user_query, region)
+
+    # Буcты по доменам из истории
+    boosts = history_boosts(intent, region)
+
+    # Если кириллица и регион дефолтный — для DDG используем ru-ru
+    force_ru_ddg = is_cyrillic(user_query) and region == "wt-wt"
+
+    # Собираем URL’ы
+    all_urls = []
+    for q in web_queries:
+        if engine in ("ddg", "both"):
+            all_urls.extend(
+                duckduckgo_search(q, max_results=max_results, region=region, intent=intent, force_ru_ddg=force_ru_ddg)
+            )
+        if engine in ("serpapi", "both"):
+            all_urls.extend(
+                serpapi_search(q, max_results=max_results, region=region, intent=intent)
+            )
+
+    # Дедуп и отсев мусора по доменам
+    all_urls = [u for u in list(dict.fromkeys(all_urls)) if not is_bad_domain(domain_of(u))]
+    logger.info(f"Collected {len(all_urls)} unique URLs")
+
+    # Скрейп
+    web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
+
+    # Жёсткая финальная чистка контента
+    filtered = []
+    for r in web_results:
+        txt = f"{r.get('name','')} {r.get('description','')} {r.get('website','')}".lower()
+        dom = domain_of(r.get("website",""))
+        if is_bad_domain(dom):
+            continue
+        if looks_like_sports_garbage(txt):
+            continue
+        if intent.get("business") and not intent.get("learn") and dom in KNOWLEDGE_DOMAINS:
+            continue
+        if should_cut_blog(r.get("website",""), txt, intent):
+            continue
+        filtered.append(r)
+
+    # Affcatalog (если нужно)
+    already_urls = set(r.get("website","") for r in filtered)
+    aff_rows = scrape_affcatalog_suggestions(
+        intent=intent, prompt_phrases=prompt_phrases, region=region, query_id=query_id, already_urls=already_urls
+    )
+    if aff_rows:
+        for ar in aff_rows:
+            ar["score"] = min(ar.get("score", 0.55) + 0.05, 0.98)
+        filtered.extend(aff_rows)
+
+    # Серверный бан доменов
+    blocked = load_blocked_domains(min_neg_weight=2.0)
+    if blocked:
+        before = len(filtered)
+        filtered = [r for r in filtered if domain_of(r.get("website","")) not in blocked]
+        logger.info(f"Blocked domains active: {len(blocked)}; removed {before - len(filtered)} rows")
+
+    # Гео-приоритизация, дедуп и сортировка
+    all_results = prefer_country_results(filtered, region)
+    seen = set(); deduped = []
+    for r in all_results:
+        w = r.get("website","").strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        deduped.append(r)
+    deduped.sort(key=lambda x: x["score"], reverse=True)
+
+    # Экспорты (опционально)
+    save_to_csv()
+    save_to_txt()
+
+    return deduped
+
+def _run_search_job(query_id: str, user_query: str, region: str, engine: str, chat_id: str | None, max_results: int):
+    try:
+        set_job_status(query_id, "running")
+        # чистим «текущую выдачу», как и раньше
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS results (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    website TEXT,
+                    description TEXT,
+                    specialization TEXT,
+                    country TEXT,
+                    source TEXT,
+                    status TEXT,
+                    suitability TEXT,
+                    score REAL
+                )"""
+            )
+            cursor.execute("DELETE FROM results")
+            conn.commit()
+
+        _perform_search_and_store(user_query, region, engine, chat_id, max_results, query_id)
+        set_job_status(query_id, "done")
+    except Exception as e:
+        logger.exception("Async search job failed")
+        set_job_status(query_id, "error", str(e))
+
 # ========= Affcatalog scraper (NEW) =========
 AFF_RELEVANT_TOKENS_RU = [
     "казино","ставк","бетт","игемблинг","игейминг","гемблинг","букмек","слоты","игры","игорн"
@@ -1423,6 +1573,8 @@ def search():
 
         # Скрейп
         web_results = search_and_scrape_websites(all_urls, prompt_phrases, region, intent, boosts, query_id)
+        
+      
 
         # Жёсткая финальная чистка контента
         filtered = []
@@ -1489,7 +1641,97 @@ def search():
         logger.error(f"API error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/search_async", methods=["POST", "OPTIONS"])
+def search_async():
+    if request.method == "OPTIONS":
+        resp = app.make_default_options_response()
+        origin = request.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
 
+    try:
+        data = request.json or {}
+        user_query = (data.get("query") or "").strip()
+        region = data.get("region", "wt-wt")
+        engine = (data.get("engine") or os.getenv("SEARCH_ENGINE", "both")).lower()
+        chat_id = (data.get("chat_id") or "").strip() or None
+        max_results = int(data.get("max_results", 15))
+
+        if not user_query:
+            return jsonify({"error": "Query is required"}), 400
+
+        intent = detect_intent(user_query)
+        query_id = insert_query_record(user_query, intent, region, chat_id)
+        set_job_status(query_id, "pending")
+
+        t = Thread(target=_run_search_job, args=(query_id, user_query, region, engine, chat_id, max_results), daemon=True)
+        t.start()
+
+        return jsonify({
+            "accepted": True,
+            "query_id": query_id,
+            "status": "pending",
+            "region": region,
+            "engine": engine,
+            "chat_id": chat_id,
+        }), 202
+    except Exception as e:
+        logger.error(f"/search_async error: {e}")
+        return jsonify({"error": str(e)}), 500
+   
+# алиас /api/*
+@app.route("/api/search_async", methods=["POST", "OPTIONS"])
+def api_search_async():
+    return search_async()
+    
+@app.route("/results/<query_id>", methods=["GET"])
+def results_by_query(query_id):
+    try:
+        job = get_job_status(query_id)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT name, url, description, country, source, score
+                FROM results_history
+                WHERE query_id = ?
+                ORDER BY score DESC
+                LIMIT 200
+            """, (query_id,))
+            rows = c.fetchall()
+
+        results = [{
+            "id": str(uuid.uuid4()),
+            "name": name or "N/A",
+            "website": url,
+            "description": description or "N/A",
+            "country": country or "N/A",
+            "source": source or "Web",
+            "score": score or 0.0,
+        } for (name, url, description, country, source, score) in rows]
+
+        return jsonify({
+            "query_id": query_id,
+            "status": job.get("status", "unknown"),
+            "error": job.get("error"),
+            "results": results,
+            "count": len(results)
+        })
+    except Exception as e:
+        logger.error(f"/results/<query_id> error: {e}")
+        return jsonify({"error": str(e)}), 500
+   
+# алиас /api/*
+@app.route("/api/results/<query_id>", methods=["GET"])
+def api_results_by_query(query_id):
+    return results_by_query(query_id)
+    
 # ========= Feedback API =========
 @app.route("/feedback", methods=["POST", "OPTIONS"])
 def feedback():
